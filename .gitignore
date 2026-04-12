@@ -114,15 +114,13 @@ Data/cbb_paper_trading/
 Data/soccer_paper_trading/
 Data/soccer_backtest/
 Data/soccer_draw_trading/
-Data/soccer_models/
 Data/paper_trading_v2/
 Data/backtest/
 
-# Trained models (regeneratable)
+# NN models (large, regeneratable)
+Models/NN_Models/
+# Root-level legacy models
 Models/*.json
-Models/**/*.json
-Models/**/*.pkl
-Models/**/*.keras
 
 # PDFs and office docs
 *.pdf
