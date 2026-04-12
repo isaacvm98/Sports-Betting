@@ -1,9 +1,8 @@
 """
 Build a comprehensive NBA backtesting dataset combining:
-- NBA game results (from OddsData.sqlite)
-- Polymarket prediction market prices (from Gamma + CLOB APIs)
+- Polymarket prediction market events as primary game source (Gamma API)
+- CLOB price history for pre-game price snapshots
 - XGBoost model predictions (using historical TeamData)
-- Traditional sportsbook odds (from OddsData.sqlite)
 - Kelly criterion sizing calculations
 
 Output: Data/backtest/nba_backtest_dataset.csv
@@ -38,6 +37,7 @@ DATA_DIR = BASE_DIR / "Data"
 BACKTEST_DIR = DATA_DIR / "backtest"
 CACHE_EVENTS = BACKTEST_DIR / "polymarket_events_cache.json"
 CACHE_PRICES = BACKTEST_DIR / "price_history_cache.json"
+CACHE_RAW_HISTORIES = BACKTEST_DIR / "price_history_raw_cache.json"
 OUTPUT_CSV = BACKTEST_DIR / "nba_backtest_dataset.csv"
 MODEL_DIR = BASE_DIR / "Models" / "XGBoost_Models"
 
@@ -133,6 +133,10 @@ def fetch_polymarket_events(use_cache=True):
     all_events = []
     offset = 0
 
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(max_retries=3)
+    session.mount("https://", adapter)
+
     while True:
         params = {
             "series_id": NBA_SERIES_ID,
@@ -143,7 +147,7 @@ def fetch_polymarket_events(use_cache=True):
             "order": "startTime",
             "ascending": "true",
         }
-        resp = requests.get(f"{GAMMA_URL}/events", params=params, timeout=30)
+        resp = session.get(f"{GAMMA_URL}/events", params=params, timeout=30)
         resp.raise_for_status()
         batch = resp.json()
 
@@ -265,8 +269,20 @@ def _find_moneyline_market(event):
 # ---------------------------------------------------------------------------
 # Phase 2: Fetch Price History
 # ---------------------------------------------------------------------------
+def _load_raw_cache():
+    """Load the raw price history cache (token -> tick data) from build_price_history.py."""
+    if CACHE_RAW_HISTORIES.exists():
+        with open(CACHE_RAW_HISTORIES) as f:
+            return json.load(f)
+    return {}
+
+
 def fetch_price_histories(events, use_cache=True):
-    """Fetch CLOB price history for events after the cutoff date."""
+    """Fetch CLOB price history for events after the cutoff date.
+
+    Uses the raw tick-level cache from build_price_history.py as primary source,
+    then falls back to the CLOB API for any missing tokens.
+    """
     if use_cache and CACHE_PRICES.exists():
         print(f"Loading cached price histories from {CACHE_PRICES.name}")
         with open(CACHE_PRICES) as f:
@@ -274,49 +290,69 @@ def fetch_price_histories(events, use_cache=True):
         print(f"  Loaded {len(histories)} price histories from cache")
         return histories
 
+    # Load raw tick cache (built by build_price_history.py)
+    raw_cache = _load_raw_cache()
+    print(f"  Loaded {len(raw_cache)} entries from raw price history cache")
+
     # Filter to events with available price history
     eligible = [
         e for e in events
         if e.get("home_token") and e.get("start_ts", 0) >= PRICE_HISTORY_CUTOFF.timestamp()
     ]
-    print(f"Fetching price history for {len(eligible)} events (post-Jan 27)...")
+    print(f"Building price history for {len(eligible)} events (post-Jan 27)...")
 
     histories = {}
+    api_fetches = 0
+    raw_hits = 0
+
     for i, event in enumerate(eligible):
         token = event["home_token"]
         game_key = f"{event['game_date_et']}_{event['home_team']}_{event['away_team']}"
 
-        try:
-            resp = requests.get(
-                f"{CLOB_URL}/prices-history",
-                params={"market": token, "interval": "max"},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        # Try raw cache first
+        history = raw_cache.get(token, [])
+        if history:
+            raw_hits += 1
+        else:
+            # Fall back to CLOB API
+            try:
+                resp = requests.get(
+                    f"{CLOB_URL}/prices-history",
+                    params={"market": token, "interval": "max"},
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                data = resp.json()
 
-            if isinstance(data, dict) and "history" in data:
-                history = data["history"]
-            elif isinstance(data, list):
-                history = data
-            else:
-                history = []
+                if isinstance(data, dict) and "history" in data:
+                    history = data["history"]
+                elif isinstance(data, list):
+                    history = data
+                else:
+                    history = []
 
-            if history:
-                snapshots = _extract_snapshots(history, event["start_ts"])
-                histories[game_key] = snapshots
+                api_fetches += 1
+                if history:
+                    raw_cache[token] = history  # Update raw cache
+            except Exception as e:
+                print(f"  Error fetching history for {game_key}: {e}")
+                api_fetches += 1
 
-        except Exception as e:
-            print(f"  Error fetching history for {game_key}: {e}")
+            if api_fetches > 0 and api_fetches % 50 == 0:
+                print(f"  API fetches: {api_fetches}...")
+            time.sleep(0.3)  # Rate limiting
 
-        if (i + 1) % 50 == 0:
-            print(f"  Fetched {i + 1}/{len(eligible)} price histories...")
+        if history:
+            snapshots = _extract_snapshots(history, event["start_ts"])
+            histories[game_key] = snapshots
 
-        time.sleep(0.3)  # Rate limiting
+    print(f"  Got price history for {len(histories)} games ({raw_hits} from cache, {api_fetches} from API)")
 
-    print(f"  Got price history for {len(histories)} games")
-
+    # Save updated raw cache
     BACKTEST_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CACHE_RAW_HISTORIES, "w") as f:
+        json.dump(raw_cache, f)
+
     with open(CACHE_PRICES, "w") as f:
         json.dump(histories, f, indent=2)
     print(f"  Cached to {CACHE_PRICES.name}")
@@ -367,16 +403,6 @@ def _extract_snapshots(history, game_start_ts):
 # ---------------------------------------------------------------------------
 # Phase 3: Load Local Data
 # ---------------------------------------------------------------------------
-def load_odds_data():
-    """Load OddsData.sqlite 2025-26 season."""
-    db_path = DATA_DIR / "OddsData.sqlite"
-    con = sqlite3.connect(str(db_path))
-    df = pd.read_sql_query('SELECT * FROM "2025-26"', con)
-    con.close()
-    print(f"Loaded {len(df)} games from OddsData.sqlite (2025-26)")
-    return df
-
-
 def load_schedule():
     """Load nba-2025-UTC.csv for days-rest calculation."""
     csv_path = DATA_DIR / "nba-2025-UTC.csv"
@@ -385,18 +411,6 @@ def load_schedule():
     df["Date"] = pd.to_datetime(df["Date"], format="%d/%m/%Y %H:%M")
     print(f"Loaded {len(df)} games from schedule CSV")
     return df
-
-
-def ml_odds_to_prob(ml_odds):
-    """Convert American moneyline odds to implied probability."""
-    if ml_odds is None or pd.isna(ml_odds):
-        return None
-    ml_odds = float(ml_odds)
-    if ml_odds > 0:
-        return 100 / (ml_odds + 100)
-    elif ml_odds < 0:
-        return abs(ml_odds) / (abs(ml_odds) + 100)
-    return 0.5
 
 
 def prob_to_american(prob):
@@ -410,35 +424,27 @@ def prob_to_american(prob):
 
 
 # ---------------------------------------------------------------------------
-# Phase 4: Match Games
+# Phase 4: Build Games from Polymarket Events
 # ---------------------------------------------------------------------------
-def match_games(odds_df, pm_events, price_histories):
-    """Match games across OddsData, Polymarket events, and price history."""
-    print("Matching games across data sources...")
+def build_games_from_polymarket(pm_events, price_histories, schedule_df):
+    """Build game rows using Polymarket events as the primary source."""
+    print("Building game list from Polymarket events...")
 
-    # Build Polymarket lookup: (date, home, away) -> event
-    pm_lookup = {}
-    for event in pm_events:
-        key = (event["game_date_et"], event["home_team"], event["away_team"])
-        pm_lookup[key] = event
-
-    rows = []
-    matched_pm = 0
     matched_prices = 0
+    rows = []
 
-    for _, odds_row in odds_df.iterrows():
-        game_date = odds_row["Date"]
-        home = odds_row["Home"]
-        away = odds_row["Away"]
+    for event in pm_events:
+        game_date = event["game_date_et"]
+        home = event["home_team"]
+        away = event["away_team"]
 
-        # Build match key
-        key = (game_date, home, away)
-
-        # Look up Polymarket event
-        pm_event = pm_lookup.get(key)
-        has_pm = pm_event is not None
-        if has_pm:
-            matched_pm += 1
+        # Result from Polymarket resolution
+        pm_winner = event.get("pm_winner")
+        home_win = None
+        if pm_winner == "home":
+            home_win = 1
+        elif pm_winner == "away":
+            home_win = 0
 
         # Look up price history
         price_key = f"{game_date}_{home}_{away}"
@@ -447,65 +453,48 @@ def match_games(odds_df, pm_events, price_histories):
         if has_prices:
             matched_prices += 1
 
-        # Parse result
-        points = odds_row.get("Points")
-        win_margin = odds_row.get("Win_Margin")
-        home_score = None
-        away_score = None
-        home_win = None
+        # Polymarket pregame prices as market probability
+        pm_home_prob = price_data.get("pm_pregame_home")
+        pm_away_prob = price_data.get("pm_pregame_away")
 
-        if points is not None and win_margin is not None and not pd.isna(points) and not pd.isna(win_margin):
-            points = int(points)
-            win_margin = int(win_margin)
-            home_score = (points + win_margin) // 2
-            away_score = (points - win_margin) // 2
-            home_win = 1 if win_margin > 0 else 0
+        # Convert to American odds for Kelly calculations
+        pm_ml_home = prob_to_american(pm_home_prob) if pm_home_prob else None
+        pm_ml_away = prob_to_american(pm_away_prob) if pm_away_prob else None
 
-        # Sportsbook odds
-        sb_ml_home = odds_row.get("ML_Home")
-        sb_ml_away = odds_row.get("ML_Away")
-        sb_home_prob = ml_odds_to_prob(sb_ml_home)
-        sb_away_prob = ml_odds_to_prob(sb_ml_away)
+        # Days rest from schedule
+        days_rest_home = calculate_days_rest(schedule_df, home, game_date)
+        days_rest_away = calculate_days_rest(schedule_df, away, game_date)
 
         row = {
             "game_date": game_date,
             "home_team": home,
             "away_team": away,
-            "pm_slug": pm_event["slug"] if has_pm else None,
-            "has_polymarket": has_pm,
+            "pm_slug": event.get("slug"),
             "has_price_history": has_prices,
-            # Results
-            "home_score": home_score,
-            "away_score": away_score,
-            "total_points": points if points and not pd.isna(points) else None,
-            "win_margin": win_margin if win_margin is not None and not pd.isna(win_margin) else None,
+            # Results (from Polymarket resolution)
             "home_win": home_win,
-            # Sportsbook
-            "sb_ml_home": int(sb_ml_home) if sb_ml_home and not pd.isna(sb_ml_home) else None,
-            "sb_ml_away": int(sb_ml_away) if sb_ml_away and not pd.isna(sb_ml_away) else None,
-            "sb_spread": odds_row.get("Spread"),
-            "sb_ou": odds_row.get("OU"),
-            "sb_home_prob": round(sb_home_prob, 4) if sb_home_prob else None,
-            "sb_away_prob": round(sb_away_prob, 4) if sb_away_prob else None,
-            # Polymarket prices
+            # Polymarket prices (market odds)
             "pm_open_home": price_data.get("pm_open_home"),
             "pm_open_away": price_data.get("pm_open_away"),
-            "pm_pregame_home": price_data.get("pm_pregame_home"),
-            "pm_pregame_away": price_data.get("pm_pregame_away"),
+            "pm_pregame_home": pm_home_prob,
+            "pm_pregame_away": pm_away_prob,
             "pm_home_max": price_data.get("pm_home_max"),
             "pm_home_min": price_data.get("pm_home_min"),
-            # Polymarket token IDs (for detailed lookup later)
-            "pm_home_token": pm_event["home_token"] if has_pm else None,
-            "pm_away_token": pm_event["away_token"] if has_pm else None,
-            # Rest days from OddsData
-            "days_rest_home": odds_row.get("Days_Rest_Home"),
-            "days_rest_away": odds_row.get("Days_Rest_Away"),
+            "pm_ml_home": pm_ml_home,
+            "pm_ml_away": pm_ml_away,
+            # Polymarket token IDs
+            "pm_home_token": event.get("home_token"),
+            "pm_away_token": event.get("away_token"),
+            # Rest days
+            "days_rest_home": days_rest_home,
+            "days_rest_away": days_rest_away,
         }
         rows.append(row)
 
     df = pd.DataFrame(rows)
-    print(f"  Matched {matched_pm}/{len(df)} games with Polymarket events")
-    print(f"  Matched {matched_prices}/{len(df)} games with price history")
+    print(f"  Built {len(df)} games from Polymarket events")
+    print(f"  Games with price history: {matched_prices}")
+    print(f"  Games with results: {df['home_win'].notna().sum()}")
     return df
 
 
@@ -592,10 +581,10 @@ def generate_predictions(df, schedule_df):
 
         # Check if TeamData exists for this date
         if game_date not in available_dates:
-            # Try day before
+            # Try previous days (up to 30 days back to handle gaps)
             dt = datetime.strptime(game_date, "%Y-%m-%d")
             found = False
-            for offset in range(1, 4):
+            for offset in range(1, 31):
                 alt_date = (dt - timedelta(days=offset)).strftime("%Y-%m-%d")
                 if alt_date in available_dates:
                     game_date = alt_date
@@ -714,24 +703,10 @@ def calc_tiered_kelly(american_odds, model_prob, market_prob):
 
 
 def compute_edges_and_kelly(df):
-    """Compute edge and Kelly sizing for each game."""
+    """Compute edge and Kelly sizing for each game (vs Polymarket prices)."""
     print("Computing edges and Kelly sizing...")
 
-    # Edge vs sportsbook
-    df["edge_home_sb"] = df.apply(
-        lambda r: round(r["model_home_prob"] - r["sb_home_prob"], 4)
-        if pd.notna(r.get("model_home_prob")) and pd.notna(r.get("sb_home_prob"))
-        else None,
-        axis=1,
-    )
-    df["edge_away_sb"] = df.apply(
-        lambda r: round(r["model_away_prob"] - r["sb_away_prob"], 4)
-        if pd.notna(r.get("model_away_prob")) and pd.notna(r.get("sb_away_prob"))
-        else None,
-        axis=1,
-    )
-
-    # Edge vs Polymarket (pregame price where available)
+    # Edge vs Polymarket pregame price
     df["edge_home_pm"] = df.apply(
         lambda r: round(r["model_home_prob"] - r["pm_pregame_home"], 4)
         if pd.notna(r.get("model_home_prob")) and pd.notna(r.get("pm_pregame_home"))
@@ -745,60 +720,38 @@ def compute_edges_and_kelly(df):
         axis=1,
     )
 
-    # Kelly vs sportsbook
-    kelly_home_sb = []
-    kelly_away_sb = []
-    tiered_home_sb = []
-    tiered_away_sb = []
+    # Kelly vs Polymarket
+    kelly_home_pm = []
+    kelly_away_pm = []
+    tiered_home_pm = []
+    tiered_away_pm = []
 
     for _, r in df.iterrows():
-        if pd.notna(r.get("model_home_prob")) and pd.notna(r.get("sb_ml_home")):
-            kh = calc_kelly(r["sb_ml_home"], r["model_home_prob"])
-            ka = calc_kelly(r["sb_ml_away"], r["model_away_prob"])
-            th = calc_tiered_kelly(r["sb_ml_home"], r["model_home_prob"], r["sb_home_prob"])
-            ta = calc_tiered_kelly(r["sb_ml_away"], r["model_away_prob"], r["sb_away_prob"])
+        if pd.notna(r.get("model_home_prob")) and pd.notna(r.get("pm_ml_home")):
+            kh = calc_kelly(r["pm_ml_home"], r["model_home_prob"])
+            ka = calc_kelly(r["pm_ml_away"], r["model_away_prob"])
+            th = calc_tiered_kelly(r["pm_ml_home"], r["model_home_prob"], r["pm_pregame_home"])
+            ta = calc_tiered_kelly(r["pm_ml_away"], r["model_away_prob"], r["pm_pregame_away"])
         else:
             kh = ka = th = ta = None
 
-        kelly_home_sb.append(kh)
-        kelly_away_sb.append(ka)
-        tiered_home_sb.append(th)
-        tiered_away_sb.append(ta)
-
-    df["kelly_home_sb"] = kelly_home_sb
-    df["kelly_away_sb"] = kelly_away_sb
-    df["tiered_kelly_home_sb"] = tiered_home_sb
-    df["tiered_kelly_away_sb"] = tiered_away_sb
-
-    # Kelly vs Polymarket (where price history available)
-    kelly_home_pm = []
-    kelly_away_pm = []
-
-    for _, r in df.iterrows():
-        if pd.notna(r.get("model_home_prob")) and pd.notna(r.get("pm_pregame_home")):
-            home_odds = prob_to_american(r["pm_pregame_home"])
-            away_odds = prob_to_american(r["pm_pregame_away"])
-            if home_odds and away_odds:
-                kh = calc_kelly(home_odds, r["model_home_prob"])
-                ka = calc_kelly(away_odds, r["model_away_prob"])
-            else:
-                kh = ka = None
-        else:
-            kh = ka = None
-
         kelly_home_pm.append(kh)
         kelly_away_pm.append(ka)
+        tiered_home_pm.append(th)
+        tiered_away_pm.append(ta)
 
     df["kelly_home_pm"] = kelly_home_pm
     df["kelly_away_pm"] = kelly_away_pm
+    df["tiered_kelly_home_pm"] = tiered_home_pm
+    df["tiered_kelly_away_pm"] = tiered_away_pm
 
-    # Determine recommended bet side (using sportsbook odds as primary)
+    # Determine recommended bet side (using Polymarket odds)
     bet_sides = []
     bet_kellys = []
 
     for _, r in df.iterrows():
-        kh = r.get("kelly_home_sb") or 0
-        ka = r.get("kelly_away_sb") or 0
+        kh = r.get("kelly_home_pm") or 0
+        ka = r.get("kelly_away_pm") or 0
 
         if kh > 0 and kh >= ka:
             bet_sides.append("home")
@@ -843,9 +796,6 @@ def print_summary(df):
     has_result = df["home_win"].notna().sum()
     print(f"Games with results: {has_result}")
 
-    has_pm = df["has_polymarket"].sum()
-    print(f"Games with Polymarket data: {has_pm}")
-
     has_prices = df["has_price_history"].sum()
     print(f"Games with price history: {has_prices}")
 
@@ -865,10 +815,11 @@ def print_summary(df):
     if len(bets) > 0:
         # How many bets are underdogs vs favorites
         underdog_bets = bets[
-            ((bets["bet_side"] == "home") & (bets["sb_home_prob"] < 0.5))
-            | ((bets["bet_side"] == "away") & (bets["sb_away_prob"] < 0.5))
+            ((bets["bet_side"] == "home") & (bets["pm_pregame_home"] < 0.5))
+            | ((bets["bet_side"] == "away") & (bets["pm_pregame_away"] < 0.5))
         ]
-        print(f"  Underdog bets: {len(underdog_bets)} ({len(underdog_bets)/len(bets):.0%})")
+        valid_underdogs = underdog_bets.dropna(subset=["pm_pregame_home"])
+        print(f"  Underdog bets: {len(valid_underdogs)} ({len(valid_underdogs)/len(bets):.0%})")
 
         # Win rate on bets
         bet_wins = bets.apply(
@@ -884,12 +835,12 @@ def print_summary(df):
         print(f"  Median Kelly %: {bets['bet_kelly'].median():.2f}%")
 
     # Edge distribution
-    if df["edge_home_sb"].notna().sum() > 0:
+    if df["edge_home_pm"].notna().sum() > 0:
         all_edges = pd.concat([
-            df["edge_home_sb"].dropna(),
-            df["edge_away_sb"].dropna(),
+            df["edge_home_pm"].dropna(),
+            df["edge_away_pm"].dropna(),
         ])
-        print(f"\nEdge distribution (vs sportsbook):")
+        print(f"\nEdge distribution (vs Polymarket):")
         print(f"  Mean: {all_edges.mean():.4f}")
         print(f"  Positive edges: {(all_edges > 0).sum()}")
         print(f"  Edges > 5%: {(all_edges > 0.05).sum()}")
@@ -913,7 +864,7 @@ def main():
 
     BACKTEST_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Phase 1: Fetch Polymarket events
+    # Phase 1: Fetch Polymarket events (primary game source)
     pm_events = fetch_polymarket_events(use_cache=use_cache)
 
     # Phase 2: Fetch price histories
@@ -923,12 +874,11 @@ def main():
     else:
         price_histories = fetch_price_histories(pm_events, use_cache=use_cache)
 
-    # Phase 3: Load local data
-    odds_df = load_odds_data()
+    # Phase 3: Load schedule for days-rest
     schedule_df = load_schedule()
 
-    # Phase 4: Match games
-    df = match_games(odds_df, pm_events, price_histories)
+    # Phase 4: Build game list from Polymarket events
+    df = build_games_from_polymarket(pm_events, price_histories, schedule_df)
 
     # Phase 5: Model predictions
     pred_df = generate_predictions(df, schedule_df)

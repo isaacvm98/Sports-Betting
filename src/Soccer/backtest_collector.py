@@ -40,8 +40,9 @@ LEAGUE_IDS = {
     "Ligue 1": 53,
 }
 
-# Season string for FotMob API
+# Season strings for FotMob API
 CURRENT_SEASON = "2025/2026"
+ALL_SEASONS = ["2024/2025", "2025/2026"]
 
 # Rate limiting
 REQUEST_DELAY = 1.0  # seconds between page fetches
@@ -97,12 +98,15 @@ class BacktestCollector:
             json.dump(data, f, indent=2, ensure_ascii=False)
         logger.info(f"Saved {len(self._cached_matches)} matches to cache")
 
-    def get_all_fixtures(self, leagues: List[str] = None) -> Dict[str, List[Dict]]:
-        """Get all finished fixtures from FotMob for specified leagues.
+    def get_all_fixtures(
+        self, leagues: List[str] = None, seasons: List[str] = None
+    ) -> Dict[str, List[Dict]]:
+        """Get all finished fixtures from FotMob for specified leagues and seasons.
 
         Returns dict of league_name -> list of fixture dicts.
         """
         target_leagues = leagues or list(LEAGUE_IDS.keys())
+        target_seasons = seasons or [CURRENT_SEASON]
         all_fixtures = {}
 
         async def _fetch():
@@ -113,23 +117,28 @@ class BacktestCollector:
                     if not league_id:
                         continue
 
-                    try:
-                        fixtures = await fm.get_league_fixtures(
-                            league_id, CURRENT_SEASON
-                        )
-                        finished = [
-                            f
-                            for f in fixtures
-                            if f.get("status", {}).get("finished", False)
-                        ]
-                        all_fixtures[league_name] = finished
-                        print(
-                            f"  {league_name}: {len(finished)} finished "
-                            f"/ {len(fixtures)} total fixtures"
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to get fixtures for {league_name}: {e}")
-                        all_fixtures[league_name] = []
+                    league_fixtures = []
+                    for season in target_seasons:
+                        try:
+                            fixtures = await fm.get_league_fixtures(
+                                league_id, season
+                            )
+                            finished = [
+                                f
+                                for f in fixtures
+                                if f.get("status", {}).get("finished", False)
+                            ]
+                            league_fixtures.extend(finished)
+                            print(
+                                f"  {league_name} ({season}): {len(finished)} finished "
+                                f"/ {len(fixtures)} total fixtures"
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"Failed to get fixtures for {league_name} {season}: {e}"
+                            )
+
+                    all_fixtures[league_name] = league_fixtures
 
         asyncio.run(_fetch())
         return all_fixtures
@@ -467,45 +476,41 @@ class BacktestCollector:
         return round(max(0, min(1, normalized)), 3)
 
     def collect(
-        self, leagues: List[str] = None, force: bool = False
+        self, leagues: List[str] = None, seasons: List[str] = None,
+        force: bool = False,
     ) -> List[Dict]:
         """Main collection method. Fetches all match data.
 
         Args:
             leagues: List of league names to collect. None = all 5.
+            seasons: List of season strings. None = current season only.
             force: If True, re-fetch even cached matches.
 
         Returns:
             List of all collected match dicts.
         """
+        target_seasons = seasons or [CURRENT_SEASON]
         print("=" * 60)
         print("  Soccer Backtest Data Collector")
-        print(f"  Season: {CURRENT_SEASON}")
+        print(f"  Seasons: {', '.join(target_seasons)}")
         print(f"  Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
         print("=" * 60)
 
         # Step 1: Get all fixtures
         print("\nStep 1: Fetching fixtures from FotMob API...")
-        all_fixtures = self.get_all_fixtures(leagues)
+        all_fixtures = self.get_all_fixtures(leagues, target_seasons)
 
         total_fixtures = sum(len(f) for f in all_fixtures.values())
         print(f"\nTotal finished fixtures: {total_fixtures}")
 
-        # Step 2: Build unique page URL list
+        # Step 2: Build page URL list (one per fixture, keyed by match ID)
         print("\nStep 2: Building page URL list...")
         pages_to_fetch = []
 
         for league_name, fixtures in all_fixtures.items():
-            slug_groups = self._get_unique_page_slugs(fixtures)
-
-            for slug_key, group_fixtures in slug_groups.items():
-                # The latest fixture will be what the page returns
-                latest = max(
-                    group_fixtures,
-                    key=lambda f: f.get("status", {}).get("utcTime", ""),
-                )
-                match_id = str(latest.get("id", ""))
-                page_url = latest.get("pageUrl", "")
+            for fixture in fixtures:
+                match_id = str(fixture.get("id", ""))
+                page_url = fixture.get("pageUrl", "")
 
                 # Check cache
                 if not force and match_id in self._cached_matches:
@@ -637,6 +642,18 @@ def main():
         help="Re-fetch all matches (ignore cache)",
     )
     parser.add_argument(
+        "--season",
+        type=str,
+        action="append",
+        help='Season to collect (e.g. "2024/2025"). Can be repeated. '
+             'Use --all-seasons for both 2024/2025 and 2025/2026.',
+    )
+    parser.add_argument(
+        "--all-seasons",
+        action="store_true",
+        help="Collect all supported seasons (2024/2025 + 2025/2026)",
+    )
+    parser.add_argument(
         "--summary",
         action="store_true",
         help="Show summary of cached data without fetching",
@@ -669,7 +686,13 @@ def main():
         return
 
     leagues = [args.league] if args.league else None
-    collector.collect(leagues=leagues, force=args.force)
+    if args.all_seasons:
+        seasons = ALL_SEASONS
+    elif args.season:
+        seasons = args.season
+    else:
+        seasons = None  # defaults to current season
+    collector.collect(leagues=leagues, seasons=seasons, force=args.force)
 
 
 if __name__ == "__main__":

@@ -113,6 +113,9 @@ Data/paper_trading/
 Data/cbb_paper_trading/
 Data/soccer_paper_trading/
 Data/soccer_backtest/
+Data/soccer_draw_trading/
+Data/soccer_models/
+Data/paper_trading_v2/
 Data/backtest/
 
 # Trained models (regeneratable)
@@ -130,3 +133,11 @@ nul
 
 # Logs
 logs/
+*.log.txt
+fetch_q1_log.txt
+
+# Personal / tool configs
+.nutmeg.user.md
+
+# Accidental files
+7%

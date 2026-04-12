@@ -24,7 +24,7 @@ except ImportError:
     ESPNLiveTracker = None
 
 # Data directories
-NBA_DATA_DIR = Path("Data/paper_trading")
+NBA_DATA_DIR = Path("Data/paper_trading_v2")
 CBB_DATA_DIR = Path("Data/cbb_paper_trading")
 SOCCER_DATA_DIR = Path("Data/soccer_paper_trading")
 
@@ -95,57 +95,55 @@ def load_alerts(limit: int = 50) -> List[Dict]:
 
 
 def normalize_nba_position(pos_id: str, pos: Dict, bankroll: float = None) -> Dict:
-    """Normalize NBA position to unified schema."""
+    """Normalize NBA V2 position to unified schema."""
     bet_side = pos.get('bet_side', '')
     bet_type = "ML"  # NBA is always moneyline
     if bankroll is None:
         bankroll = STARTING_BANKROLL
 
-    # Get edge based on bet side
-    if bet_side == 'home':
-        edge = pos.get('home_edge', 0)
-        entry_price = pos.get('entry_home_prob', 0)
-    elif bet_side == 'away':
-        edge = pos.get('away_edge', 0)
-        entry_price = pos.get('entry_away_prob', 0)
+    # V2 fields: entry_price, bet_edge, model_prob, leg, is_favorite
+    entry_price = pos.get('entry_price', 0)
+    edge = pos.get('bet_edge', 0)
+    amount = pos.get('bet_amount', 0)
+    leg = pos.get('leg', '?')
+    is_favorite = pos.get('is_favorite', False)
+
+    # Fallback for V1 positions still in data
+    if not entry_price:
+        if bet_side == 'home':
+            entry_price = pos.get('entry_home_prob', 0)
+            edge = pos.get('home_edge', 0)
+        elif bet_side == 'away':
+            entry_price = pos.get('entry_away_prob', 0)
+            edge = pos.get('away_edge', 0)
+
+    # Current price from monitoring
+    current_price = pos.get('current_pm_price', entry_price)
+    if entry_price and current_price:
+        price_change = (current_price - entry_price) / entry_price
     else:
-        edge = 0
-        entry_price = 0
+        price_change = 0
 
-    # Price change is stored directly
-    price_change = pos.get('current_price_change', 0)
-
-    # Calculate current price from entry + change
-    # price_change is relative: (current - entry) / entry
-    if entry_price and price_change:
-        current_price = entry_price * (1 + price_change)
-    else:
-        current_price = entry_price
-
-    # Use stored bet_amount (entry-time snapshot) if available, else fall back
-    kelly = pos.get('bet_kelly', 0)
-    stored_amount = pos.get('bet_amount')
-    if stored_amount is not None:
-        amount = stored_amount
-    else:
-        amount = (kelly / 100) * bankroll if kelly else 0
-
+    # P&L
     if pos.get('status') == 'open' and bet_side:
-        unrealized_pnl = amount * price_change if price_change else 0
+        unrealized_pnl = pos.get('unrealized_pnl', amount * price_change if price_change else 0)
     else:
         unrealized_pnl = pos.get('pnl', 0) if pos.get('pnl') is not None else 0
+
+    # Leg display in bet_type
+    leg_display = "FAV" if is_favorite else "DOG"
 
     return {
         "id": pos_id,
         "league": "NBA",
         "game": f"{pos.get('away_team', '?')} @ {pos.get('home_team', '?')}",
         "game_time": pos.get('game_time', ''),
-        "bet_type": bet_type,
+        "bet_type": f"ML ({leg_display})",
         "bet_side": bet_side.upper() if bet_side else "-",
         "entry_price": entry_price,
         "current_price": current_price,
         "price_change_pct": price_change * 100 if price_change else 0,
-        "size_pct": kelly,
+        "size_pct": (amount / bankroll * 100) if bankroll and amount else 0,
         "amount": amount,
         "edge": edge,
         "edge_display": f"{edge*100:+.1f}%" if edge else "-",
@@ -153,6 +151,8 @@ def normalize_nba_position(pos_id: str, pos: Dict, bankroll: float = None) -> Di
         "pnl": unrealized_pnl,
         "won": pos.get('won'),
         "entry_time": pos.get('entry_time', ''),
+        "leg": leg,
+        "is_favorite": is_favorite,
     }
 
 

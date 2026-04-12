@@ -1,8 +1,10 @@
 """
-Polymarket Paper Trading Scheduler
+Polymarket Paper Trading Scheduler — V2 Dual-Leg Strategy
 
 Smart scheduling - places bets 10 minutes before each game starts.
-Monitors positions and closes after games end.
+Dual-leg strategy from Stage 4 backtest:
+  Leg 1 (Favorites): edge >= 7%, model conf >= 60% -> hold to binary resolution
+  Leg 2 (Underdogs): edge >= 7%, conf < 60%, entry >= $0.30 -> ESPN WP exits
 
 Usage:
     python -m src.Polymarket.scheduler
@@ -23,38 +25,40 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import requests
-import numpy as np
-import pandas as pd
-import xgboost as xgb
 
 from src.DataProviders.PolymarketOddsProvider import PolymarketOddsProvider
-from src.Utils.tools import get_json_data, to_data_frame
-from src.Utils.Kelly_Criterion import calculate_kelly_criterion
-from src.Utils.Dictionaries import team_index_current
 from src.Polymarket.websocket_monitor import WebSocketPriceMonitor
-from src.Polymarket.paper_trader import (
+
+# V2 strategy: imports from paper_trader_v2 for positions/bankroll/trades
+from src.Polymarket.paper_trader_v2 import (
     load_positions,
     save_positions,
     log_trade,
-    DATA_DIR,
-    get_model_predictions,
-    american_odds_to_probability,
-    get_take_profit_threshold,
-    get_underdog_take_profit_threshold,
-    is_underdog_position,
-    calculate_position_pnl,
-    calculate_exit_pnl,
     load_bankroll,
     save_bankroll,
-    STOP_LOSS_PCT,
-    EARLY_EXIT_ENABLED,
-    UNDERDOG_TAKE_PROFIT_ENABLED,
-    UNDERDOG_TAKE_PROFIT_MAX_ENTRY,
+    DATA_DIR,
     STARTING_BANKROLL,
+    # Strategy parameters
+    MIN_EDGE,
+    MIN_ENTRY_PRICE,
+    MAX_BET_PCT,
+    FAV_MIN_CONF,
+    DOG_MIN_ENTRY,
+    ESPN_SL_THRESH,
+    ESPN_TP_THRESH,
+    Q1_UNDERDOG_EXIT,
+    half_kelly_size,
+)
+
+# Model prediction pipeline (shared between V1 and V2)
+from src.Polymarket.paper_trader import (
+    get_model_predictions,
+    american_odds_to_probability,
     DISCORD_WEBHOOK_URL,
 )
+
 from src.Utils.DrawdownManager import DrawdownManager
-from src.Utils.AlertManager import AlertManager, AlertType
+from src.Utils.AlertManager import AlertManager
 from src.Polymarket.price_logger import get_price_logger
 from src.DataProviders.espn_wp_logger import get_espn_wp_logger
 
@@ -68,7 +72,6 @@ except ImportError:
 MINUTES_BEFORE_GAME = 10   # Place bets X minutes before game
 MONITOR_INTERVAL = 5    # Monitor every X minutes
 LOCAL_TIMEZONE_OFFSET = -5  # EST = UTC-5 (adjust for your timezone)
-MAX_KELLY_PCT = 15      # Maximum Kelly % per position (caps exposure to bad info)
 
 LOG_DIR = PROJECT_ROOT / "logs"
 LOG_FILE = LOG_DIR / "scheduler.log"
@@ -157,7 +160,10 @@ def get_todays_games_with_times():
 
 
 def init_single_game(event, game_time, logger, alert_mgr=None, ws_monitor=None):
-    """Initialize position for a single game.
+    """Initialize position for a single game using V2 dual-leg strategy.
+
+    Leg 1 (Favorites): edge >= 7%, model conf >= 60% -> hold to resolution
+    Leg 2 (Underdogs): edge >= 7%, conf < 60%, entry >= $0.30 -> ESPN WP exits
 
     Args:
         event: Polymarket event data
@@ -176,7 +182,6 @@ def init_single_game(event, game_time, logger, alert_mgr=None, ws_monitor=None):
     # Find matching game
     matching_key = None
     for game_key in all_odds.keys():
-        # Match by team names in title
         home, away = game_key.split(":")
         if home.split()[-1] in title or away.split()[-1] in title:
             matching_key = game_key
@@ -191,7 +196,6 @@ def init_single_game(event, game_time, logger, alert_mgr=None, ws_monitor=None):
 
     home_ml = game_odds[home_team]['money_line_odds']
     away_ml = game_odds[away_team]['money_line_odds']
-    ou_line = game_odds['under_over_odds']
 
     # Get token IDs for WebSocket price monitoring
     home_token_id = game_odds.get('home_token_id')
@@ -212,40 +216,69 @@ def init_single_game(event, game_time, logger, alert_mgr=None, ws_monitor=None):
     model_home_prob = pred['home_prob']
     model_away_prob = pred['away_prob']
 
-    # Market probabilities
+    # Market probabilities (from Polymarket token prices)
     market_home_prob = american_odds_to_probability(home_ml)
     market_away_prob = american_odds_to_probability(away_ml)
 
-    # Calculate edge and Kelly
+    # Calculate edges
     home_edge = model_home_prob - market_home_prob
     away_edge = model_away_prob - market_away_prob
 
-    try:
-        kelly_home = calculate_kelly_criterion(home_ml, model_home_prob)
-        kelly_away = calculate_kelly_criterion(away_ml, model_away_prob)
-    except:
-        kelly_home = kelly_away = 0
-
-    # Determine bet side and apply Kelly cap
+    # Determine best bet side (highest edge that passes minimum)
     bet_side = None
-    bet_kelly = 0
-    kelly_raw = 0  # Store uncapped value for logging
-    if kelly_home > 0 and kelly_home >= kelly_away:
+    bet_edge = 0
+    model_prob = 0
+    entry_price = 0
+
+    if home_edge >= MIN_EDGE:
         bet_side = "home"
-        kelly_raw = kelly_home
-        bet_kelly = min(kelly_home, MAX_KELLY_PCT)
-    elif kelly_away > 0:
+        bet_edge = home_edge
+        model_prob = model_home_prob
+        entry_price = market_home_prob
+    if away_edge >= MIN_EDGE and away_edge > home_edge:
         bet_side = "away"
-        kelly_raw = kelly_away
-        bet_kelly = min(kelly_away, MAX_KELLY_PCT)
+        bet_edge = away_edge
+        model_prob = model_away_prob
+        entry_price = market_away_prob
+
+    # Log game info
+    local_game_time = game_time + timedelta(hours=LOCAL_TIMEZONE_OFFSET)
+    logger.info(f"  Game time: {local_game_time.strftime('%I:%M %p')} local")
+    logger.info(f"  Market: Home {market_home_prob:.1%} | Away {market_away_prob:.1%}")
+    logger.info(f"  Model:  Home {model_home_prob:.1%} | Away {model_away_prob:.1%}")
+    logger.info(f"  Edge:   Home {home_edge:+.1%} | Away {away_edge:+.1%}")
+
+    if not bet_side:
+        logger.info(f"  >>> NO BET (no edge >= {MIN_EDGE:.0%})")
+        return None
+
+    if entry_price < MIN_ENTRY_PRICE:
+        logger.info(f"  >>> NO BET (entry price ${entry_price:.3f} < ${MIN_ENTRY_PRICE})")
+        return None
+
+    # Determine which leg this bet belongs to
+    is_favorite = model_prob >= FAV_MIN_CONF
+    is_underdog = not is_favorite
+
+    # LEG 2 filter: underdogs must have entry >= DOG_MIN_ENTRY
+    if is_underdog and entry_price < DOG_MIN_ENTRY:
+        logger.info(f"  >>> NO BET (underdog entry ${entry_price:.3f} < ${DOG_MIN_ENTRY:.2f} floor)")
+        return None
+
+    leg = "LEG1_FAV" if is_favorite else "LEG2_DOG"
+    exit_strategy = "hold to resolution" if is_favorite else "ESPN WP exits"
+
+    # Size the bet (Half-Kelly, capped at MAX_BET_PCT)
+    entry_bankroll = load_bankroll()
+    bet_amount = half_kelly_size(model_prob, entry_price, entry_bankroll)
+
+    if bet_amount <= 0:
+        logger.info(f"  >>> NO BET (bankroll depleted)")
+        return None
 
     # Create position
     positions = load_positions()
     position_id = f"{matching_key}_{datetime.now().strftime('%Y%m%d_%H%M')}"
-
-    # Snapshot bet_amount at entry time for accurate P&L calculation
-    entry_bankroll = load_bankroll()
-    entry_bet_amount = (bet_kelly / 100) * entry_bankroll if bet_kelly and bet_side else 0
 
     position = {
         "game_key": matching_key,
@@ -254,45 +287,34 @@ def init_single_game(event, game_time, logger, alert_mgr=None, ws_monitor=None):
         "home_token_id": home_token_id,
         "away_token_id": away_token_id,
         "game_time": game_time.isoformat(),
-        "entry_time": datetime.now(timezone.utc).isoformat(),
-        "entry_home_prob": market_home_prob,
-        "entry_away_prob": market_away_prob,
-        "entry_home_odds": home_ml,
-        "entry_away_odds": away_ml,
-        "ou_line": ou_line,
-        "model_home_prob": model_home_prob,
-        "model_away_prob": model_away_prob,
-        "home_edge": home_edge,
-        "away_edge": away_edge,
-        "kelly_home": kelly_home,
-        "kelly_away": kelly_away,
         "bet_side": bet_side,
-        "bet_kelly": bet_kelly,
-        "kelly_raw": kelly_raw,
-        "bet_amount": round(entry_bet_amount, 2),
+        "entry_price": round(entry_price, 4),
+        "bet_amount": round(bet_amount, 2),
+        "model_prob": round(model_prob, 4),
+        "bet_edge": round(bet_edge, 4),
+        "leg": leg,
+        "is_favorite": is_favorite,
+        "entry_time": datetime.now(timezone.utc).isoformat(),
         "entry_bankroll": round(entry_bankroll, 2),
         "status": "open",
+        # Exit tracking
         "exit_time": None,
-        "exit_reason": None,
+        "exit_type": None,
+        "exit_price": None,
+        "pnl": None,
+        # ESPN WP snapshots (filled during monitoring for underdogs)
+        "espn_event_id": None,
+        "espn_q1_wp": None,
+        "espn_q1_score": None,
+        "espn_q2_wp": None,
+        "espn_q2_score": None,
     }
 
     positions[position_id] = position
     save_positions(positions)
 
-    # Log
-    local_game_time = game_time + timedelta(hours=LOCAL_TIMEZONE_OFFSET)
-    logger.info(f"  Game time: {local_game_time.strftime('%I:%M %p')} local")
-    logger.info(f"  Market: Home {market_home_prob:.1%} | Away {market_away_prob:.1%}")
-    logger.info(f"  Model:  Home {model_home_prob:.1%} | Away {model_away_prob:.1%}")
-    logger.info(f"  Edge:   Home {home_edge:+.1%} | Away {away_edge:+.1%}")
-
-    if bet_side:
-        if kelly_raw > MAX_KELLY_PCT:
-            logger.info(f"  >>> BET: {bet_side.upper()} ({bet_kelly:.1f}% Kelly, capped from {kelly_raw:.1f}%)")
-        else:
-            logger.info(f"  >>> BET: {bet_side.upper()} ({bet_kelly:.1f}% Kelly)")
-    else:
-        logger.info(f"  >>> NO BET (no edge)")
+    logger.info(f"  >>> {leg} BET {bet_side.upper()} ${bet_amount:.2f} "
+                f"(edge {bet_edge:+.1%}, conf {model_prob:.1%}, {exit_strategy})")
 
     log_trade({
         "type": "ENTRY",
@@ -300,24 +322,27 @@ def init_single_game(event, game_time, logger, alert_mgr=None, ws_monitor=None):
         "position_id": position_id,
         "game": f"{away_team} @ {home_team}",
         "game_time": game_time.isoformat(),
-        "model_home_prob": model_home_prob,
-        "market_home_prob": market_home_prob,
         "bet_side": bet_side,
-        "kelly": bet_kelly
+        "leg": leg,
+        "entry_price": entry_price,
+        "bet_amount": bet_amount,
+        "model_prob": model_prob,
+        "bet_edge": bet_edge,
     })
 
     # Send bet placement alert to Discord
-    if alert_mgr and bet_side:
+    if alert_mgr:
         game = f"{away_team} @ {home_team}"
-        edge = home_edge if bet_side == "home" else away_edge
-        alert_mgr.info(f"NEW BET: {game} - {bet_side.upper()}", {
-            "kelly": f"{bet_kelly:.1f}%",
-            "edge": f"{edge:+.1%}",
+        alert_mgr.info(f"NEW BET: {game} - {leg} {bet_side.upper()}", {
+            "size": f"${bet_amount:.2f} (Half-Kelly, cap {MAX_BET_PCT:.0%})",
+            "edge": f"{bet_edge:+.1%}",
+            "conf": f"{model_prob:.1%}",
+            "exit": exit_strategy,
             "system": "NBA",
         })
 
     # Subscribe to WebSocket for real-time price monitoring
-    if ws_monitor and bet_side:
+    if ws_monitor:
         token_id = home_token_id if bet_side == "home" else away_token_id
         if token_id:
             ws_monitor.subscribe([token_id])
@@ -569,6 +594,39 @@ def check_market_resolved(game_key, home_team, away_team, logger, game_time=None
     return False, None
 
 
+def _calculate_v2_pnl(position, won):
+    """Calculate P&L for V2 positions using Polymarket share model.
+
+    Buy shares at entry_price, get $1 if win, $0 if loss.
+    Win P&L = bet_amount * (1/entry_price - 1)
+    Loss P&L = -bet_amount
+    """
+    bet_amount = position.get('bet_amount', 0)
+    entry_price = position.get('entry_price', 0)
+
+    if not bet_amount or not entry_price:
+        return 0
+
+    if won:
+        return round(bet_amount * (1.0 / entry_price - 1), 2)
+    else:
+        return round(-bet_amount, 2)
+
+
+def _calculate_v2_exit_pnl(position, exit_price):
+    """Calculate P&L for early exit at a given Polymarket price.
+
+    P&L = bet_amount * (exit_price / entry_price - 1)
+    """
+    bet_amount = position.get('bet_amount', 0)
+    entry_price = position.get('entry_price', 0)
+
+    if not bet_amount or not entry_price:
+        return 0
+
+    return round(bet_amount * (exit_price / entry_price - 1), 2)
+
+
 def _record_resolution(position, position_id, winner, pnl, logger):
     """Record a position resolution and update drawdown manager.
 
@@ -596,8 +654,10 @@ def _record_resolution(position, position_id, winner, pnl, logger):
             webhook_url=DISCORD_WEBHOOK_URL,
             webhook_platform="discord"
         )
+        leg = position.get('leg', '?')
         am.resolution(game, won, pnl, {
             "bet_side": bet_side,
+            "leg": leg,
             "winner": winner,
             "bankroll": new_bankroll,
         })
@@ -613,11 +673,11 @@ def _record_resolution(position, position_id, winner, pnl, logger):
 
 
 def monitor_positions(logger, ws_monitor=None):
-    """Monitor open positions for market resolution.
+    """Monitor open positions — V2 dual-leg strategy.
 
-    NOTE: Early exits (stop-loss/take-profit) are DISABLED by default.
-    Analysis shows positions running to resolution outperform early exits.
-    Set EARLY_EXIT_ENABLED = True in paper_trader.py to re-enable exit signals.
+    Leg 1 (Favorites): Hold to binary resolution. No early exits.
+    Leg 2 (Underdogs): ESPN WP exits at Q1 (leading) and halftime (SL/TP).
+    Both legs: Detect market resolution via WebSocket/REST/API.
 
     Args:
         logger: Logger instance
@@ -633,25 +693,33 @@ def monitor_positions(logger, ws_monitor=None):
     provider = PolymarketOddsProvider()
     current_odds = provider.get_odds()
 
-    # Fetch ESPN win probabilities once per cycle for logging
+    # Fetch ESPN win probabilities for underdog exit logic + logging
     espn_games = {}
     if _ESPN_AVAILABLE:
         try:
             espn = ESPNProvider('nba')
-            espn.CACHE_TTL = 0  # Fresh data for logging
+            espn.CACHE_TTL = 0  # Fresh data
             espn_games = espn.get_all_live_win_probabilities()
         except Exception as e:
             logger.debug(f"ESPN fetch skipped: {e}")
+
+    bankroll = load_bankroll()
 
     for position_id, position in open_positions.items():
         game_key = position['game_key']
         home_team = position['home_team']
         away_team = position['away_team']
         bet_side = position.get('bet_side')
+        entry_price = position.get('entry_price', 0)
+        bet_amount = position.get('bet_amount', 0)
+        is_favorite = position.get('is_favorite', position.get('model_prob', 0) >= FAV_MIN_CONF)
+        leg = position.get('leg', 'LEG1_FAV' if is_favorite else 'LEG2_DOG')
 
-        # Check if market is still in pre-game odds
+        # ===== GET CURRENT POLYMARKET PRICE =====
+        current_pm_price = None  # Price for our bet side
+
         if game_key not in current_odds:
-            # Game has started - try WebSocket prices first, then fall back to REST API
+            # Game has started - try WebSocket first, then REST API
             current_home_prob = None
             current_away_prob = None
             is_closed = False
@@ -667,12 +735,9 @@ def monitor_positions(logger, ws_monitor=None):
                 if token_id:
                     ws_price = ws_monitor.get_price(token_id)
                     if ws_price and ws_price.get('mid') is not None:
-                        # WebSocket gives us the price for our bet side token
                         bet_price = ws_price.get('mid')
 
-                        # Check if market resolved via WebSocket (price near 0 or 1)
                         if bet_price >= 0.95 or bet_price <= 0.05:
-                            # Prices indicate resolution - verify with API that market is officially closed
                             logger.info(f"WebSocket prices at resolution level for {away_team}@{home_team} ({bet_side}={bet_price:.3f}) - verifying with API...")
                             api_resolved, api_winner = check_market_resolved(game_key, home_team, away_team, logger, game_time=game_time)
 
@@ -681,30 +746,24 @@ def monitor_positions(logger, ws_monitor=None):
                                 ws_winner = api_winner
                                 logger.info(f"API confirmed resolution: {away_team}@{home_team} -> {api_winner.upper()} won")
                             else:
-                                # Market not officially closed yet, just update prices
                                 logger.debug(f"Market not officially closed yet, tracking prices")
-                                if bet_side == 'home':
-                                    current_home_prob = bet_price
-                                    current_away_prob = 1 - bet_price
-                                else:
-                                    current_away_prob = bet_price
-                                    current_home_prob = 1 - bet_price
+                                current_pm_price = bet_price
                         else:
-                            # Game still in progress
-                            if bet_side == 'home':
-                                current_home_prob = bet_price
-                                current_away_prob = 1 - bet_price
-                            else:
-                                current_away_prob = bet_price
-                                current_home_prob = 1 - bet_price
+                            current_pm_price = bet_price
                             logger.debug(f"WebSocket prices: {away_team}@{home_team} -> {bet_side}={bet_price:.3f}")
 
             # Log price observation (WebSocket path)
-            if current_home_prob is not None:
+            if current_pm_price is not None:
+                if bet_side == 'home':
+                    current_home_prob = current_pm_price
+                    current_away_prob = 1 - current_pm_price
+                else:
+                    current_away_prob = current_pm_price
+                    current_home_prob = 1 - current_pm_price
                 game_date = position.get('game_time', '')[:10]
                 get_price_logger().log(game_date, home_team, away_team, current_home_prob, current_away_prob, source="ws")
 
-            # Log ESPN win probability alongside market price
+            # Log ESPN win probability
             if espn_games:
                 espn_key = f"{home_team}:{away_team}"
                 espn_game = espn_games.get(espn_key)
@@ -723,46 +782,43 @@ def monitor_positions(logger, ws_monitor=None):
             # If WebSocket + API confirmed resolution, process it
             if ws_resolved and ws_winner:
                 won = (bet_side == ws_winner) if bet_side else False
-                pnl = calculate_position_pnl(position, won)
+                pnl = _calculate_v2_pnl(position, won)
 
                 position['status'] = 'resolved'
                 position['exit_time'] = datetime.now(timezone.utc).isoformat()
-                position['exit_reason'] = 'market_resolved'
+                position['exit_type'] = 'resolution'
+                position['exit_price'] = 1.0 if won else 0.0
                 position['winner'] = ws_winner
                 position['won'] = won
                 position['pnl'] = pnl
 
-                # Update bankroll and record in drawdown manager
                 if pnl != 0:
                     _record_resolution(position, position_id, ws_winner, pnl, logger)
 
                 result_str = "WON" if won else "LOST"
-                logger.info(f"RESOLVED (WebSocket): {away_team} @ {home_team} - {ws_winner.upper()} won | We {result_str} ${abs(pnl):.2f}")
+                logger.info(f"RESOLVED (WS): {away_team} @ {home_team} - {leg} {ws_winner.upper()} won | {result_str} ${abs(pnl):.2f}")
 
                 log_trade({
                     "type": "RESOLVED",
                     "time": datetime.now(timezone.utc).isoformat(),
                     "position_id": position_id,
                     "game": f"{away_team} @ {home_team}",
+                    "leg": leg,
                     "winner": ws_winner,
                     "bet_side": bet_side,
                     "won": won,
                     "pnl": pnl,
                     "source": "websocket",
-                    "entry_edge": position.get(f"{bet_side}_edge", 0) if bet_side else 0,
-                    "max_profit_pct": position.get('max_profit_pct', 0),
-                    "max_drawdown_pct": position.get('max_drawdown_pct', 0),
                 })
                 continue
 
             # Fall back to REST API if WebSocket didn't have prices
-            # But skip if WebSocket already provided a recent update (avoid overwriting good data)
-            if current_home_prob is None:
+            if current_pm_price is None:
                 last_ws = position.get('last_ws_update')
                 if last_ws:
                     try:
                         ws_age = (datetime.now(timezone.utc) - datetime.fromisoformat(last_ws.replace('Z', '+00:00'))).total_seconds()
-                        if ws_age < 300:  # WebSocket updated within 5 minutes - trust it
+                        if ws_age < 300:
                             logger.debug(f"Skipping REST fallback for {away_team} @ {home_team} - WebSocket data is {ws_age:.0f}s old")
                             continue
                     except (ValueError, TypeError):
@@ -772,49 +828,50 @@ def monitor_positions(logger, ws_monitor=None):
                 current_home_prob, current_away_prob, is_closed, found_market_id = get_live_prices(
                     home_team, away_team, logger, game_time=game_time, market_id=stored_market_id
                 )
+
+                if found_market_id and not stored_market_id:
+                    position['market_id'] = found_market_id
+
+                if current_home_prob is not None:
+                    current_pm_price = current_home_prob if bet_side == 'home' else current_away_prob
+                    game_date = position.get('game_time', '')[:10]
+                    get_price_logger().log(game_date, home_team, away_team, current_home_prob, current_away_prob, source="rest")
             else:
-                logger.debug(f"Using WebSocket prices for {away_team} @ {home_team}")
+                is_closed = False
 
-            # Store market_id if we found it and don't have one
-            if found_market_id and not stored_market_id:
-                position['market_id'] = found_market_id
-
-            if current_home_prob is None:
+            if current_pm_price is None:
                 # Couldn't get prices - check if resolved via API
                 logger.info(f"Could not get live prices - checking if resolved via API...")
                 resolved, winner = check_market_resolved(game_key, home_team, away_team, logger, game_time=game_time)
 
                 if resolved and winner:
-                    # Market resolved - calculate P&L
                     won = (bet_side == winner) if bet_side else False
-                    pnl = calculate_position_pnl(position, won)
+                    pnl = _calculate_v2_pnl(position, won)
 
                     position['status'] = 'resolved'
                     position['exit_time'] = datetime.now(timezone.utc).isoformat()
-                    position['exit_reason'] = 'market_resolved'
+                    position['exit_type'] = 'resolution'
+                    position['exit_price'] = 1.0 if won else 0.0
                     position['winner'] = winner
                     position['won'] = won
                     position['pnl'] = pnl
 
-                    # Update bankroll and record in drawdown manager
                     if pnl != 0:
                         _record_resolution(position, position_id, winner, pnl, logger)
 
                     result_str = "WON" if won else "LOST"
-                    logger.info(f"RESOLVED: {away_team} @ {home_team} - {winner.upper()} won | We {result_str} ${abs(pnl):.2f}")
+                    logger.info(f"RESOLVED: {away_team} @ {home_team} - {leg} {winner.upper()} won | {result_str} ${abs(pnl):.2f}")
 
                     log_trade({
                         "type": "RESOLVED",
                         "time": datetime.now(timezone.utc).isoformat(),
                         "position_id": position_id,
                         "game": f"{away_team} @ {home_team}",
+                        "leg": leg,
                         "winner": winner,
                         "bet_side": bet_side,
                         "won": won,
                         "pnl": pnl,
-                        "entry_edge": position.get(f"{bet_side}_edge", 0) if bet_side else 0,
-                        "max_profit_pct": position.get('max_profit_pct', 0),
-                        "max_drawdown_pct": position.get('max_drawdown_pct', 0),
                     })
                 else:
                     logger.info(f"Market not yet resolved: {away_team} @ {home_team}")
@@ -822,69 +879,168 @@ def monitor_positions(logger, ws_monitor=None):
 
             # Check if market is closed (game ended) with a clear winner
             if is_closed:
-                if current_home_prob > 0.95:
+                if current_home_prob and current_home_prob > 0.95:
                     winner = 'home'
-                elif current_away_prob > 0.95:
+                elif current_away_prob and current_away_prob > 0.95:
                     winner = 'away'
                 else:
                     winner = None
 
                 if winner:
                     won = (bet_side == winner) if bet_side else False
-                    pnl = calculate_position_pnl(position, won)
+                    pnl = _calculate_v2_pnl(position, won)
 
                     position['status'] = 'resolved'
                     position['exit_time'] = datetime.now(timezone.utc).isoformat()
-                    position['exit_reason'] = 'market_resolved'
+                    position['exit_type'] = 'resolution'
+                    position['exit_price'] = 1.0 if won else 0.0
                     position['winner'] = winner
                     position['won'] = won
                     position['pnl'] = pnl
 
-                    # Update bankroll and record in drawdown manager
                     if pnl != 0:
                         _record_resolution(position, position_id, winner, pnl, logger)
 
                     result_str = "WON" if won else "LOST"
-                    logger.info(f"RESOLVED: {away_team} @ {home_team} - {winner.upper()} won | We {result_str} ${abs(pnl):.2f}")
+                    logger.info(f"RESOLVED: {away_team} @ {home_team} - {leg} {winner.upper()} won | {result_str} ${abs(pnl):.2f}")
 
                     log_trade({
                         "type": "RESOLVED",
                         "time": datetime.now(timezone.utc).isoformat(),
                         "position_id": position_id,
                         "game": f"{away_team} @ {home_team}",
+                        "leg": leg,
                         "winner": winner,
                         "bet_side": bet_side,
                         "won": won,
                         "pnl": pnl,
-                        "entry_edge": position.get(f"{bet_side}_edge", 0) if bet_side else 0,
-                        "max_profit_pct": position.get('max_profit_pct', 0),
-                        "max_drawdown_pct": position.get('max_drawdown_pct', 0),
                     })
                     continue
 
-            # Got live prices - log them and track max profit/drawdown
-            logger.info(f"Live odds: Home {current_home_prob:.1%} | Away {current_away_prob:.1%}")
+            # ===== LIVE POSITION — CHECK EXIT LOGIC =====
+            logger.info(f"Live: {away_team} @ {home_team} | {leg} {bet_side.upper()} @ ${entry_price:.3f} -> ${current_pm_price:.3f}")
 
-            # Log price observation (REST path)
-            game_date = position.get('game_time', '')[:10]
-            get_price_logger().log(game_date, home_team, away_team, current_home_prob, current_away_prob, source="rest")
+            # Track unrealized P&L
+            unrealized_pnl = bet_amount * (current_pm_price / entry_price - 1) if entry_price > 0 else 0
+            position['current_pm_price'] = current_pm_price
+            position['unrealized_pnl'] = round(unrealized_pnl, 2)
 
-            # Track max profit/drawdown during position lifetime for analytics
-            if bet_side and current_home_prob is not None:
-                entry_prob = position['entry_home_prob'] if bet_side == 'home' else position['entry_away_prob']
-                current_prob = current_home_prob if bet_side == 'home' else current_away_prob
-                current_change = (current_prob - entry_prob) / entry_prob if entry_prob > 0 else 0
+            # FAVORITES: just hold, no exit logic
+            if is_favorite:
+                logger.info(f"  {leg} HOLD (favorite — holds to resolution) | unrealized ${unrealized_pnl:+.2f}")
+                continue
 
-                position['current_price_change'] = current_change
-                if 'max_profit_pct' not in position:
-                    position['max_profit_pct'] = current_change
-                    position['max_drawdown_pct'] = current_change
-                else:
-                    position['max_profit_pct'] = max(position['max_profit_pct'], current_change)
-                    position['max_drawdown_pct'] = min(position['max_drawdown_pct'], current_change)
+            # ===== UNDERDOG ESPN WP EXIT LOGIC =====
+            espn_key = f"{home_team}:{away_team}"
+            espn_data = espn_games.get(espn_key) or espn_games.get(f"{away_team}:{home_team}")
+            if not espn_data:
+                for key, data in espn_games.items():
+                    if home_team in key or away_team in key:
+                        espn_data = data
+                        break
+
+            if not espn_data:
+                logger.info(f"  {leg} HOLD (ESPN: no data, game may not have started)")
+                continue
+
+            period = espn_data.get('period', 0)
+            home_wp = espn_data.get('home_win_prob', 0.5)
+            home_score = espn_data.get('home_score', 0)
+            away_score = espn_data.get('away_score', 0)
+
+            bet_wp = home_wp if bet_side == 'home' else (1 - home_wp)
+            score_diff = (home_score - away_score) * (1 if bet_side == 'home' else -1)
+
+            logger.info(f"  ESPN: P{period} {away_score}-{home_score} | bet WP: {bet_wp:.1%} | score diff: {score_diff:+d}")
+
+            # Store ESPN snapshots
+            if period >= 1 and position.get('espn_q1_wp') is None:
+                position['espn_q1_wp'] = round(bet_wp, 4)
+                position['espn_q1_score'] = f"{home_score}-{away_score}"
+
+            if period >= 2 and position.get('espn_q2_wp') is None:
+                position['espn_q2_wp'] = round(bet_wp, 4)
+                position['espn_q2_score'] = f"{home_score}-{away_score}"
+
+            if espn_data.get('event_id') and not position.get('espn_event_id'):
+                position['espn_event_id'] = espn_data['event_id']
+
+            # EXIT LOGIC: ESPN WP as signal, Polymarket price as execution
+            exit_type = None
+
+            # Q1 underdog exit: underdog is leading after Q1
+            if (Q1_UNDERDOG_EXIT and period >= 1
+                    and score_diff > 0 and position.get('espn_q1_wp') is not None
+                    and current_pm_price and current_pm_price > 0):
+                exit_type = "q1_exit"
+                logger.info(f"  >>> Q1 UNDERDOG EXIT: leading by {score_diff}, selling at PM ${current_pm_price:.3f}")
+
+            # Halftime stop-loss
+            elif period >= 2 and bet_wp < ESPN_SL_THRESH and current_pm_price and current_pm_price > 0:
+                exit_type = "stop"
+                logger.info(f"  >>> HALFTIME STOP-LOSS: WP {bet_wp:.1%} < {ESPN_SL_THRESH:.0%}, selling at PM ${current_pm_price:.3f}")
+
+            # Halftime take-profit
+            elif period >= 2 and bet_wp > ESPN_TP_THRESH and current_pm_price and current_pm_price > 0:
+                exit_type = "take_profit"
+                logger.info(f"  >>> HALFTIME TAKE-PROFIT: WP {bet_wp:.1%} > {ESPN_TP_THRESH:.0%}, selling at PM ${current_pm_price:.3f}")
+
+            # Execute exit
+            if exit_type and current_pm_price:
+                pnl = _calculate_v2_exit_pnl(position, current_pm_price)
+                bankroll += pnl
+
+                position['status'] = 'closed'
+                position['exit_time'] = datetime.now(timezone.utc).isoformat()
+                position['exit_type'] = exit_type
+                position['exit_price'] = round(current_pm_price, 4)
+                position['pnl'] = pnl
+
+                save_bankroll(bankroll)
+
+                # Record in drawdown manager
+                try:
+                    dm = DrawdownManager(data_dir=DATA_DIR, starting_bankroll=STARTING_BANKROLL)
+                    dm.record_pnl(pnl, position_id, bankroll)
+                except Exception as e:
+                    logger.error(f"Error recording to drawdown manager: {e}")
+
+                # Discord alert
+                try:
+                    am = AlertManager(
+                        data_dir=DATA_DIR, enable_console=False,
+                        webhook_url=DISCORD_WEBHOOK_URL, webhook_platform="discord"
+                    )
+                    game = f"{away_team} @ {home_team}"
+                    am.info(f"ESPN EXIT: {game} - {exit_type}", {
+                        "leg": leg, "pnl": f"${pnl:+.2f}",
+                        "exit_price": f"${current_pm_price:.3f}",
+                        "bankroll": f"${bankroll:.2f}",
+                    })
+                except Exception as e:
+                    logger.warning(f"Alert error: {e}")
+
+                result_str = "PROFIT" if pnl >= 0 else "LOSS"
+                logger.info(f"  EXIT: {result_str} ${pnl:+.2f} | Bankroll: ${bankroll:.2f}")
+
+                log_trade({
+                    "type": "EXIT",
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "position_id": position_id,
+                    "game": f"{away_team} @ {home_team}",
+                    "leg": leg,
+                    "exit_type": exit_type,
+                    "exit_price": current_pm_price,
+                    "espn_wp": bet_wp,
+                    "pnl": pnl,
+                    "bankroll": bankroll,
+                })
+            else:
+                logger.info(f"  {leg} HOLD (no exit signal yet) | unrealized ${unrealized_pnl:+.2f}")
+
             continue
 
-        # Market still in pre-game - use OddsProvider prices
+        # ===== PRE-GAME: Market still open, just track prices =====
         game_odds = current_odds[game_key]
         current_home_ml = game_odds[home_team]['money_line_odds']
 
@@ -893,131 +1049,20 @@ def monitor_positions(logger, ws_monitor=None):
 
         current_home_prob = american_odds_to_probability(current_home_ml)
         current_away_prob = 1 - current_home_prob
+        current_pm_price = current_home_prob if bet_side == 'home' else current_away_prob
 
         # Log price observation (pre-game path)
         game_date = position.get('game_time', '')[:10]
         get_price_logger().log(game_date, home_team, away_team, current_home_prob, current_away_prob, source="pregame")
 
-        entry_home_prob = position['entry_home_prob']
-        entry_away_prob = position['entry_away_prob']
-
-        # Calculate change
-        home_change = (current_home_prob - entry_home_prob) / entry_home_prob if entry_home_prob > 0 else 0
-        away_change = (current_away_prob - entry_away_prob) / entry_away_prob if entry_away_prob > 0 else 0
-
-        # Track max profit/drawdown during position lifetime for analytics
-        if bet_side:
-            current_change = home_change if bet_side == 'home' else away_change
-            position['current_price_change'] = current_change
-            if 'max_profit_pct' not in position:
-                position['max_profit_pct'] = current_change
-                position['max_drawdown_pct'] = current_change
-            else:
-                position['max_profit_pct'] = max(position['max_profit_pct'], current_change)
-                position['max_drawdown_pct'] = min(position['max_drawdown_pct'], current_change)
-
-        # === EXIT LOGIC ===
-        # Two independent systems:
-        # 1. Legacy full early exits (stop-loss + take-profit on all bets) - EARLY_EXIT_ENABLED
-        # 2. Underdog-only take-profit (no stop-loss) - UNDERDOG_TAKE_PROFIT_ENABLED
-
-        exit_triggered = False
-        exit_reason = None
-
-        if EARLY_EXIT_ENABLED:
-            # Legacy: stop-loss and take-profit on ALL positions
-            entry_prob = entry_home_prob if bet_side == 'home' else entry_away_prob
-            take_profit_pct = get_take_profit_threshold(None, entry_prob=entry_prob)
-
-            if bet_side == 'home':
-                if home_change <= -STOP_LOSS_PCT:
-                    exit_triggered = True
-                    exit_reason = f"STOP_LOSS (Home dropped {home_change:.1%})"
-                elif take_profit_pct and home_change >= take_profit_pct:
-                    exit_triggered = True
-                    exit_reason = f"TAKE_PROFIT (Home up {home_change:.1%})"
-            elif bet_side == 'away':
-                if away_change <= -STOP_LOSS_PCT:
-                    exit_triggered = True
-                    exit_reason = f"STOP_LOSS (Away dropped {away_change:.1%})"
-                elif take_profit_pct and away_change >= take_profit_pct:
-                    exit_triggered = True
-                    exit_reason = f"TAKE_PROFIT (Away up {away_change:.1%})"
-
-        elif UNDERDOG_TAKE_PROFIT_ENABLED and bet_side:
-            # Underdog-only take-profit (no stop-loss)
-            entry_prob = entry_home_prob if bet_side == 'home' else entry_away_prob
-
-            if entry_prob < UNDERDOG_TAKE_PROFIT_MAX_ENTRY:
-                tp_threshold = get_underdog_take_profit_threshold(entry_prob)
-
-                if tp_threshold is not None:
-                    price_change_for_side = home_change if bet_side == 'home' else away_change
-
-                    if price_change_for_side >= tp_threshold:
-                        exit_triggered = True
-                        exit_reason = (
-                            f"UNDERDOG_TAKE_PROFIT ({bet_side.title()} up "
-                            f"{price_change_for_side:.1%}, threshold {tp_threshold:.0%}, "
-                            f"entry {entry_prob:.1%})"
-                        )
-                    else:
-                        logger.debug(
-                            f"Underdog TP tracking: {away_team} @ {home_team} | "
-                            f"{bet_side} {price_change_for_side:+.1%} / {tp_threshold:.0%} threshold"
-                        )
-            else:
-                # Favorites / moderate underdogs (>=35%): hold to resolution
-                logger.debug(
-                    f"Holding (not underdog TP eligible): {away_team} @ {home_team} | "
-                    f"entry_prob={entry_prob:.1%}, Change: Home {home_change:+.1%}, Away {away_change:+.1%}"
-                )
-
-        if exit_triggered:
-            price_change = home_change if bet_side == 'home' else away_change
-            pnl = calculate_exit_pnl(position, price_change)
-
-            # Update bankroll and record in drawdown manager
-            bankroll = load_bankroll()
-            new_bankroll = bankroll + pnl
-            save_bankroll(new_bankroll)
-
-            # Record in drawdown manager (tracking only, no halt)
-            try:
-                dm = DrawdownManager(data_dir=DATA_DIR, starting_bankroll=STARTING_BANKROLL)
-                dm.record_pnl(pnl, position_id, new_bankroll)
-            except Exception as e:
-                logger.error(f"Error recording to drawdown manager: {e}")
-
-            position['status'] = 'closed'
-            position['exit_reason'] = exit_reason
-            position['exit_time'] = datetime.now(timezone.utc).isoformat()
-            position['exit_home_prob'] = current_home_prob
-            position['exit_away_prob'] = current_away_prob
-            position['pnl'] = pnl
-            position['exit_price_change'] = price_change
-
-            result_str = "PROFIT" if pnl >= 0 else "LOSS"
-            logger.info(f"EXIT: {away_team} @ {home_team} - {exit_reason} | {result_str}: ${pnl:+.2f} | Bankroll: ${new_bankroll:.2f}")
-
-            log_trade({
-                "type": "EXIT",
-                "time": datetime.now(timezone.utc).isoformat(),
-                "position_id": position_id,
-                "game": f"{away_team} @ {home_team}",
-                "reason": exit_reason,
-                "price_change": price_change,
-                "pnl": pnl,
-                "bankroll": new_bankroll
-            })
-        elif not EARLY_EXIT_ENABLED and not (UNDERDOG_TAKE_PROFIT_ENABLED and bet_side):
-            logger.debug(f"Holding: {away_team} @ {home_team} | Change: Home {home_change:+.1%}, Away {away_change:+.1%}")
+        unrealized_pnl = bet_amount * (current_pm_price / entry_price - 1) if entry_price > 0 else 0
+        logger.debug(f"Pre-game: {away_team} @ {home_team} | {leg} @ ${current_pm_price:.3f} | unrealized ${unrealized_pnl:+.2f}")
 
     save_positions(positions)
 
 
 def generate_daily_report(logger, report_date=None):
-    """Generate end-of-day summary with P&L.
+    """Generate end-of-day summary with P&L — V2 dual-leg format.
 
     Args:
         logger: Logger instance
@@ -1042,63 +1087,78 @@ def generate_daily_report(logger, report_date=None):
 
     # Calculate P&L from all finished positions
     total_pnl = sum(p.get('pnl', 0) for p in all_finished)
-    wins = [p for p in all_finished if p.get('pnl', 0) > 0]
-    losses = [p for p in all_finished if p.get('pnl', 0) < 0]
+    wins = [p for p in all_finished if (p.get('pnl') or 0) > 0]
+    losses = [p for p in all_finished if (p.get('pnl') or 0) <= 0]
 
     current_bankroll = load_bankroll()
 
+    # Leg breakdown
+    fav_bets = [p for p in bets if p.get('is_favorite', False)]
+    dog_bets = [p for p in bets if not p.get('is_favorite', False)]
+    fav_finished = [p for p in all_finished if p.get('is_favorite', False)]
+    dog_finished = [p for p in all_finished if not p.get('is_favorite', False)]
+
     report = []
     report.append("=" * 60)
-    report.append(f"DAILY REPORT - {report_date}")
+    report.append(f"DAILY REPORT (V2 DUAL-LEG) - {report_date}")
     report.append("=" * 60)
-    report.append(f"\nGames tracked: {len(date_positions)}")
-    report.append(f"Bets placed: {len(bets)}")
-    report.append(f"Early exits (stop-loss/take-profit): {len(closed)}")
+    report.append(f"\nBets placed: {len(bets)} (favorites: {len(fav_bets)}, underdogs: {len(dog_bets)})")
+    report.append(f"ESPN exits (underdogs): {len(closed)}")
     report.append(f"Game resolutions: {len(resolved)}")
-
-    if bets:
-        total_kelly = sum(p.get('bet_kelly', 0) for p in bets)
-        report.append(f"Total Kelly: {total_kelly:.1f}%")
 
     report.append(f"\n--- P&L SUMMARY ---")
     report.append(f"Wins: {len(wins)} | Losses: {len(losses)}")
-    if len(all_finished) > 0:
+    if all_finished:
         win_rate = len(wins) / len(all_finished) * 100
         report.append(f"Win Rate: {win_rate:.1f}%")
     report.append(f"Daily P&L: ${total_pnl:+.2f}")
     report.append(f"Current Bankroll: ${current_bankroll:.2f}")
 
+    # Leg breakdown P&L
+    if fav_finished:
+        fav_pnl = sum(p.get('pnl', 0) for p in fav_finished)
+        fav_wins = sum(1 for p in fav_finished if (p.get('pnl') or 0) > 0)
+        report.append(f"  Leg 1 (Favorites): {len(fav_finished)} trades, "
+                       f"{fav_wins}W/{len(fav_finished)-fav_wins}L, P&L ${fav_pnl:+.2f}")
+    if dog_finished:
+        dog_pnl = sum(p.get('pnl', 0) for p in dog_finished)
+        dog_wins = sum(1 for p in dog_finished if (p.get('pnl') or 0) > 0)
+        report.append(f"  Leg 2 (Underdogs): {len(dog_finished)} trades, "
+                       f"{dog_wins}W/{len(dog_finished)-dog_wins}L, P&L ${dog_pnl:+.2f}")
+
     if closed:
-        report.append("\n--- EARLY EXITS (REALIZED P&L) ---")
+        report.append("\n--- ESPN EXITS (UNDERDOGS) ---")
         for p in closed:
             game = f"{p['away_team']} @ {p['home_team']}"
             side = p.get('bet_side', '').upper()
-            reason = p.get('exit_reason', '')
+            exit_type = p.get('exit_type', '?')
             pnl = p.get('pnl', 0)
-            price_change = p.get('exit_price_change', 0)
+            exit_price = p.get('exit_price', 0)
             report.append(f"  {game}")
-            report.append(f"    Bet: {side} | {reason} | P&L: ${pnl:+.2f} ({price_change:+.1%})")
+            report.append(f"    {side} | {exit_type} @ ${exit_price:.3f} | P&L: ${pnl:+.2f}")
 
     if resolved:
         report.append("\n--- GAME RESOLUTIONS ---")
         for p in resolved:
             game = f"{p['away_team']} @ {p['home_team']}"
             side = p.get('bet_side', '').upper()
+            leg = p.get('leg', '?')
             winner = p.get('winner', '').upper()
             result = "WIN" if p.get('won') else "LOSS"
             pnl = p.get('pnl', 0)
             report.append(f"  {game}")
-            report.append(f"    Bet: {side} | Winner: {winner} | {result}: ${pnl:+.2f}")
+            report.append(f"    {leg} {side} | Winner: {winner} | {result}: ${pnl:+.2f}")
 
     if bets:
         report.append("\n--- ALL BETS ---")
         for p in bets:
             game = f"{p['away_team']} @ {p['home_team']}"
             side = p.get('bet_side', '').upper()
-            kelly = p.get('bet_kelly', 0)
-            edge = p.get(f"{p.get('bet_side')}_edge", 0)
+            leg = p.get('leg', '?')
+            edge = p.get('bet_edge', 0)
+            conf = p.get('model_prob', 0)
             status = p.get('status', 'unknown')
-            report.append(f"  {game}: {side} ({kelly:.1f}%, edge: {edge:+.1%}) [{status}]")
+            report.append(f"  {game}: {leg} {side} (edge: {edge:+.1%}, conf: {conf:.1%}) [{status}]")
 
     report.append("\n" + "=" * 60)
 
@@ -1117,8 +1177,10 @@ def run_scheduler():
     logger = setup_logging()
 
     logger.info("=" * 60)
-    logger.info("POLYMARKET SMART SCHEDULER")
+    logger.info("POLYMARKET V2 DUAL-LEG SCHEDULER")
     logger.info("=" * 60)
+    logger.info(f"Strategy: Leg 1 (FAV >= {FAV_MIN_CONF:.0%}) hold | Leg 2 (DOG >= ${DOG_MIN_ENTRY:.2f}) ESPN exits")
+    logger.info(f"Edge threshold: {MIN_EDGE:.0%} | Sizing: Half-Kelly (cap {MAX_BET_PCT:.0%})")
     logger.info(f"Bets placed: {MINUTES_BEFORE_GAME} minutes before each game")
     logger.info(f"Monitor interval: {MONITOR_INTERVAL} minutes")
     logger.info(f"Timezone offset: UTC{LOCAL_TIMEZONE_OFFSET:+d}")
@@ -1157,7 +1219,7 @@ def run_scheduler():
             logger.info(f"Subscribed to {len(token_ids)} position tokens via WebSocket")
 
     # Send startup alert
-    alert_mgr.info("NBA Paper Trader started", {"system": "NBA", "status": "online"})
+    alert_mgr.info("NBA Paper Trader V2 (Dual-Leg) started", {"system": "NBA", "status": "online"})
 
     initialized_games = set()  # Track games we've already bet on
     last_monitor = None
@@ -1278,18 +1340,17 @@ def show_schedule():
 
 
 def show_status():
-    """Show current positions and bankroll status."""
-    from src.Polymarket.paper_trader import STARTING_BANKROLL
-
+    """Show current positions and bankroll status — V2 dual-leg format."""
     positions = load_positions()
     bankroll = load_bankroll()
 
     print("=" * 60)
-    print("PAPER TRADING STATUS")
+    print("PAPER TRADING V2 — DUAL-LEG STATUS")
     print("=" * 60)
 
     print(f"\nStarting Bankroll: ${STARTING_BANKROLL:.2f}")
     print(f"Current Bankroll:  ${bankroll:.2f}")
+    print(f"Return:            {(bankroll - STARTING_BANKROLL) / STARTING_BANKROLL:+.1%}")
     print(f"Total P&L:         ${bankroll - STARTING_BANKROLL:+.2f}")
 
     open_pos = [p for p in positions.values() if p['status'] == 'open']
@@ -1297,75 +1358,48 @@ def show_status():
     closed_pos = [p for p in positions.values() if p['status'] == 'closed']
     all_finished = resolved_pos + closed_pos
 
-    print(f"\nOpen positions: {len(open_pos)}")
-    print(f"Closed (early exit): {len(closed_pos)}")
+    fav_open = [p for p in open_pos if p.get('is_favorite', False)]
+    dog_open = [p for p in open_pos if not p.get('is_favorite', False)]
+
+    print(f"\nOpen positions: {len(open_pos)} (favorites: {len(fav_open)}, underdogs: {len(dog_open)})")
+    print(f"ESPN exits (underdogs): {len(closed_pos)}")
     print(f"Resolved (game ended): {len(resolved_pos)}")
 
     if all_finished:
-        wins = len([p for p in all_finished if p.get('pnl', 0) > 0])
-        losses = len([p for p in all_finished if p.get('pnl', 0) < 0])
-        win_rate = wins / len(all_finished) * 100 if all_finished else 0
+        wins = len([p for p in all_finished if (p.get('pnl') or 0) > 0])
+        losses = len([p for p in all_finished if (p.get('pnl') or 0) <= 0])
+        win_rate = wins / len(all_finished) * 100
         print(f"\nWin/Loss: {wins}W - {losses}L ({win_rate:.1f}%)")
+
+        # Leg breakdown
+        fav_finished = [p for p in all_finished if p.get('is_favorite', False)]
+        dog_finished = [p for p in all_finished if not p.get('is_favorite', False)]
+        if fav_finished:
+            fav_pnl = sum(p.get('pnl', 0) for p in fav_finished)
+            fav_wins = sum(1 for p in fav_finished if (p.get('pnl') or 0) > 0)
+            print(f"  Leg 1 (Favorites): {len(fav_finished)} trades, "
+                  f"{fav_wins}W/{len(fav_finished)-fav_wins}L, P&L ${fav_pnl:+.2f}")
+        if dog_finished:
+            dog_pnl = sum(p.get('pnl', 0) for p in dog_finished)
+            dog_wins = sum(1 for p in dog_finished if (p.get('pnl') or 0) > 0)
+            print(f"  Leg 2 (Underdogs): {len(dog_finished)} trades, "
+                  f"{dog_wins}W/{len(dog_finished)-dog_wins}L, P&L ${dog_pnl:+.2f}")
 
     if open_pos:
         print("\n--- OPEN POSITIONS ---")
         for p in open_pos:
             game = f"{p['away_team']} @ {p['home_team']}"
             side = p.get('bet_side', 'none').upper()
-            kelly = p.get('bet_kelly', 0)
-            print(f"  {game}: {side} ({kelly:.1f}%)")
+            leg = p.get('leg', '?')
+            edge = p.get('bet_edge', 0)
+            conf = p.get('model_prob', 0)
+            print(f"  {game}: {leg} {side} @ ${p.get('entry_price', 0):.3f} | "
+                  f"${p.get('bet_amount', 0):.2f} | edge {edge:+.1%} conf {conf:.1%}")
 
 
 def fix_exit_signals():
-    """Retroactively process exit_signal positions to calculate realized P/L."""
-    from src.Polymarket.paper_trader import calculate_exit_pnl, STARTING_BANKROLL
-
-    positions = load_positions()
-    exit_signals = {k: v for k, v in positions.items() if v.get('status') == 'exit_signal'}
-
-    if not exit_signals:
-        print("No exit_signal positions to fix.")
-        return
-
-    print(f"Found {len(exit_signals)} positions with exit_signal status to process...")
-
-    # Reset bankroll to starting value, then process all exits chronologically
-    bankroll = STARTING_BANKROLL
-    total_pnl = 0
-
-    # Sort by exit time
-    sorted_exits = sorted(exit_signals.items(), key=lambda x: x[1].get('exit_time', ''))
-
-    for position_id, position in sorted_exits:
-        entry_prob = position['entry_home_prob'] if position['bet_side'] == 'home' else position['entry_away_prob']
-        exit_prob = position.get('exit_home_prob') if position['bet_side'] == 'home' else position.get('exit_away_prob')
-
-        if entry_prob and exit_prob:
-            price_change = (exit_prob - entry_prob) / entry_prob
-
-            # Calculate P/L
-            kelly_pct = position.get('bet_kelly', 0) / 100
-            position_size = bankroll * kelly_pct
-            pnl = round(position_size * price_change, 2)
-
-            # Update position
-            position['status'] = 'closed'
-            position['pnl'] = pnl
-            position['exit_price_change'] = price_change
-
-            bankroll += pnl
-            total_pnl += pnl
-
-            game = f"{position['away_team']} @ {position['home_team']}"
-            result = "PROFIT" if pnl >= 0 else "LOSS"
-            print(f"  {game}: {position['exit_reason']} | {result}: ${pnl:+.2f}")
-
-    # Save updated positions and bankroll
-    save_positions(positions)
-    save_bankroll(bankroll)
-
-    print(f"\nTotal P&L: ${total_pnl:+.2f}")
-    print(f"Final Bankroll: ${bankroll:.2f}")
+    """Legacy: no longer needed in V2. Kept for backwards compatibility."""
+    print("V2 dual-leg strategy does not use exit_signal status. No action needed.")
 
 
 def main():

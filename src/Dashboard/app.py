@@ -158,7 +158,7 @@ BLOOMBERG_CSS = """
 def get_file_mtime() -> float:
     """Get max modification time of data files."""
     files = [
-        Path("Data/paper_trading/positions.json"),
+        Path("Data/paper_trading_v2/positions.json"),
         Path("Data/cbb_paper_trading/positions.json"),
         Path("Data/soccer_paper_trading/positions.json"),
     ]

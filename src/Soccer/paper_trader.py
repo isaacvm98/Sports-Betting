@@ -41,7 +41,6 @@ BANKROLL_FILE = DATA_DIR / "bankroll.json"
 STARTING_BANKROLL = 1000.0        # Starting paper bankroll
 KELLY_FRACTION = 0.15             # Conservative: 15% fractional Kelly
 MAX_BET_PCT = 8.0                 # Max 8% of bankroll per bet
-MAX_DAILY_EXPOSURE = 0.30         # Max 30% total daily exposure
 MAX_SIMULTANEOUS_POSITIONS = 4    # Max open positions at once
 
 # Exit strategy: "equalization" = sell when score ties (backtest-validated)
@@ -260,16 +259,7 @@ def open_position(signal: MomentumSignal) -> Optional[str]:
         logger.info(f"Bet amount too small: ${bet_amount:.2f}")
         return None
 
-    # Check daily exposure
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    daily_bets = sum(
-        p["bet_amount"]
-        for p in positions.values()
-        if p["status"] == "open" and p.get("entry_time", "").startswith(today)
-    )
-    if (daily_bets + bet_amount) / bankroll > MAX_DAILY_EXPOSURE:
-        logger.info(f"Daily exposure limit reached ({MAX_DAILY_EXPOSURE:.0%})")
-        return None
 
     # Create position
     position_id = (
