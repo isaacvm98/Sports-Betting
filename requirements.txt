@@ -14,3 +14,4 @@ plotly>=5.18.0
 websocket-client>=1.6.0
 fotmob-wrapper>=0.0.5
 lifelines
+pyarrow>=15.0.0

@@ -31,9 +31,37 @@ import requests
 
 from src.DataProviders.PolymarketOddsProvider import PolymarketOddsProvider
 from src.DataProviders.ESPNProvider import ESPNProvider
+from src.DataProviders.PriceHistoryProvider import PriceHistoryProvider
 
 # Reuse model prediction pipeline from existing paper trader
 from src.Polymarket.paper_trader import get_model_predictions, american_odds_to_probability
+
+
+def fetch_market_context(token_id):
+    """Fetch pre-game market-context features for the mispricing filter.
+
+    Returns dict with open_price, price_max, price_min, price_range.
+    All values are in probability units [0,1]. Returns Nones on failure.
+    """
+    empty = {"open_price": None, "price_max": None, "price_min": None, "price_range": None}
+    if not token_id:
+        return empty
+    try:
+        history = PriceHistoryProvider().get_price_history(token_id)
+        if not history:
+            return empty
+        prices = [h["p"] for h in history if "p" in h]
+        if not prices:
+            return empty
+        return {
+            "open_price": round(prices[0], 4),
+            "price_max": round(max(prices), 4),
+            "price_min": round(min(prices), 4),
+            "price_range": round(max(prices) - min(prices), 4),
+        }
+    except Exception as e:
+        print(f"    Market context fetch failed: {e}")
+        return empty
 
 # =========================================================================
 # STRATEGY PARAMETERS (from backtest Stage 4 — no look-ahead bias)
@@ -353,6 +381,19 @@ def init_positions(force=False):
               f"(edge {bet_edge:+.1%}, conf {model_prob:.1%}, {exit_strategy})")
         print()
 
+        # Mispricing-filter features: fetch PM price history for bet-side token
+        bet_token = home_token if bet_side == "home" else away_token
+        mkt = fetch_market_context(bet_token)
+        open_move = (entry_price - mkt["open_price"]) if mkt["open_price"] is not None else None
+
+        # Rest differential: days rest of the bet side minus the opponent
+        rest_home = pred.get("days_rest_home")
+        rest_away = pred.get("days_rest_away")
+        if rest_home is not None and rest_away is not None:
+            rest_diff = (rest_home - rest_away) if bet_side == "home" else (rest_away - rest_home)
+        else:
+            rest_diff = None
+
         log_trade({
             "type": "ENTRY",
             "time": datetime.now(timezone.utc).isoformat(),
@@ -364,6 +405,15 @@ def init_positions(force=False):
             "bet_amount": bet_amount,
             "model_prob": model_prob,
             "bet_edge": bet_edge,
+            # Market-context features for the mispricing filter (Task 3)
+            "open_price": mkt["open_price"],
+            "price_max": mkt["price_max"],
+            "price_min": mkt["price_min"],
+            "price_range": mkt["price_range"],
+            "open_move": round(open_move, 4) if open_move is not None else None,
+            "days_rest_home": rest_home,
+            "days_rest_away": rest_away,
+            "rest_diff": rest_diff,
         })
 
     save_positions(positions)

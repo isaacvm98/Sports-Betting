@@ -425,6 +425,8 @@ def get_model_predictions(games, odds):
                 'away_prob': away_prob,
                 'confidence': round(prob_extremity, 3),
                 'ci_width': round(ci_width, 3),
+                'days_rest_home': home_days_off.days,
+                'days_rest_away': away_days_off.days,
             }
 
         except Exception as e:

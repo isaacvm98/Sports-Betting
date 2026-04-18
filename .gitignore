@@ -126,6 +126,9 @@ Models/*.json
 *.pdf
 *.xlsx
 
+# Large data artifacts (tick snapshots, etc — regeneratable)
+*.parquet
+
 # Windows artifacts
 nul
 
