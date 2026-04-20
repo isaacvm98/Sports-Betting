@@ -26,7 +26,7 @@ import pandas as pd
 import xgboost as xgb
 from sklearn.calibration import CalibratedClassifierCV
 
-from src.Soccer.equalizer_model import (
+from src.Soccer.feature_builder import (
     build_features, get_feature_columns, _get_season, _score_at_minute,
 )
 from src.Soccer.survival_model import (
@@ -65,7 +65,7 @@ def kelly_no(p_draw, draw_price):
 # ── Train models (walk-forward) ─────────────────────────────────────────
 def train_models(matches_raw):
     """Train XGBoost (was_draw target) and Cox on 2024/25 data."""
-    # Build features from all matches (equalizer_model handles multi-entry)
+    # Build features from all matches (one row per entry minute)
     df = build_features(matches_raw)
 
     # Add was_draw target

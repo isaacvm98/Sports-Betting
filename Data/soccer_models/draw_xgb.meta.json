@@ -1,0 +1,71 @@
+{
+  "xgb": {
+    "calibrated": "<pickled CalibratedClassifierCV>",
+    "feature_cols": [
+      "xg_share",
+      "xg_diff",
+      "total_xg",
+      "is_home_losing",
+      "score_level",
+      "total_goals_before",
+      "losing_goals_before",
+      "mins_since_last_goal",
+      "entry_minute",
+      "losing_goals_per_90",
+      "losing_late_pct",
+      "opp_conceded_per_90",
+      "league_premier_league",
+      "league_la_liga",
+      "league_bundesliga",
+      "league_serie_a",
+      "league_ligue_1"
+    ],
+    "trained_at": "2026-04-20T00:36:45.299826+00:00",
+    "train_season": "2024/2025",
+    "n_train": 4203,
+    "n_draws_train": 903,
+    "hyperparams": {
+      "n_estimators": 200,
+      "max_depth": 3,
+      "learning_rate": 0.05,
+      "subsample": 0.8,
+      "colsample_bytree": 0.8,
+      "eval_metric": "logloss",
+      "random_state": 42,
+      "verbosity": 0
+    },
+    "git_sha": "b67df885891e60e01e8d6f925f2b9fec14f8fc2a",
+    "matches_file": "Data\\soccer_backtest\\matches.2026-04-19.json",
+    "matches_sha256": "31b72a05a4da0923c4ffab0002f01bb8e46e3dcd2d70d86402c71335d7e43d90"
+  },
+  "cox": {
+    "trained_at": "2026-04-20T00:36:45.299826+00:00",
+    "train_season": "2024/2025",
+    "n_obs": 6893,
+    "concordance_index": 0.7018632204829388,
+    "git_sha": "b67df885891e60e01e8d6f925f2b9fec14f8fc2a",
+    "matches_file": "Data\\soccer_backtest\\matches.2026-04-19.json",
+    "matches_sha256": "31b72a05a4da0923c4ffab0002f01bb8e46e3dcd2d70d86402c71335d7e43d90"
+  },
+  "eval_season": "2025/2026",
+  "eval_metrics": {
+    "n_eval": 3291,
+    "n_draws": 713,
+    "actual_draw_rate": 0.2166514737161957,
+    "mean_pred": 0.22331463675962976,
+    "calibration_gap": 0.006663163043434062,
+    "auc": 0.6442783200606709,
+    "brier": 0.16351390962308038,
+    "log_loss": 0.5037543864195307
+  },
+  "data_quality": {
+    "n_matches": 3230,
+    "n_with_was_draw": 3230,
+    "n_disagreements": 0,
+    "disagreement_rate": 0.0,
+    "n_with_cards_field": 3230,
+    "n_with_subs_field": 3230,
+    "red_cards_per_match": 0.2154798761609907,
+    "subs_per_match": 9.00092879256966
+  }
+}

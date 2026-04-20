@@ -87,7 +87,7 @@ python -m src.Polymarket.paper_trader_v2 --reset     # reset bankroll/positions
 
 Hold-to-expiry execution — no in-game exits. Also bets the NO side when PM overprices draws in 0-1 games.
 
-Files: `src/Soccer/draw_scanner.py`, `src/Soccer/draw_trader.py`, `src/Soccer/survival_model.py`, `src/Soccer/equalizer_model.py`.
+Files: `src/Soccer/draw_scanner.py`, `src/Soccer/draw_trader.py`, `src/Soccer/survival_model.py`, `src/Soccer/feature_builder.py`, `src/Soccer/train_models.py`.
 
 ---
 

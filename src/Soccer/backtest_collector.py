@@ -67,10 +67,18 @@ NEXT_DATA_PATTERN = re.compile(
 class BacktestCollector:
     """Collects historical match data from FotMob for backtesting."""
 
-    def __init__(self, data_dir: Path = DATA_DIR):
-        self.data_dir = Path(data_dir)
+    def __init__(
+        self,
+        data_dir: Path = DATA_DIR,
+        matches_file: Optional[Path] = None,
+    ):
+        if matches_file is not None:
+            self.matches_file = Path(matches_file)
+            self.data_dir = self.matches_file.parent
+        else:
+            self.data_dir = Path(data_dir)
+            self.matches_file = self.data_dir / "matches.json"
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.matches_file = self.data_dir / "matches.json"
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self._cached_matches: Dict[str, Dict] = {}
@@ -235,8 +243,10 @@ class BacktestCollector:
         # Date
         match_date = general.get("matchTimeUTCDate", "")[:10]  # YYYY-MM-DD
 
-        # Goal events
+        # Goal + card + substitution events
         goals = self._extract_goals(content)
+        cards = self._extract_cards(content)
+        substitutions = self._extract_substitutions(content)
 
         # Momentum per minute
         momentum = self._extract_momentum(content)
@@ -294,6 +304,8 @@ class BacktestCollector:
             "xg_home": xg_home,
             "xg_away": xg_away,
             "goals": goals,
+            "cards": cards,
+            "substitutions": substitutions,
             "momentum_data": momentum is not None,
             "qualifying": qualifying,
             "losing_team_at_70": losing_team_at_70,
@@ -347,6 +359,60 @@ class BacktestCollector:
         # Sort by minute
         goals.sort(key=lambda g: g["minute"])
         return goals
+
+    def _extract_cards(self, content: Dict) -> List[Dict]:
+        """Extract card events from FotMob page content. Normalizes
+        FotMob's `card` field {Yellow, Red, YellowRed} to
+        {yellow, red, second_yellow}."""
+        cards = []
+        events_data = content.get("matchFacts", {}).get("events", {})
+        for event in events_data.get("events", []):
+            if event.get("type") != "Card":
+                continue
+            raw = (event.get("card") or "").strip()
+            if raw == "Yellow":
+                card_type = "yellow"
+            elif raw == "Red":
+                card_type = "red"
+            elif raw == "YellowRed":
+                card_type = "second_yellow"
+            else:
+                continue
+            minute = event.get("time", 0)
+            added = event.get("overloadTime") or 0
+            cards.append({
+                "minute": minute,
+                "added_time": added,
+                "team": "home" if event.get("isHome") else "away",
+                "card_type": card_type,
+                "player": (event.get("player") or {}).get("name", "Unknown"),
+            })
+        cards.sort(key=lambda c: (c["minute"], c["added_time"]))
+        return cards
+
+    def _extract_substitutions(self, content: Dict) -> List[Dict]:
+        """Extract substitution events from FotMob page content.
+
+        FotMob's substitution events do not always include playerIn/Out
+        names directly — the player object is usually empty. We capture
+        what we can and rely on (minute, team) for feature derivation.
+        """
+        subs = []
+        events_data = content.get("matchFacts", {}).get("events", {})
+        for event in events_data.get("events", []):
+            if event.get("type") != "Substitution":
+                continue
+            minute = event.get("time", 0)
+            added = event.get("overloadTime") or 0
+            subs.append({
+                "minute": minute,
+                "added_time": added,
+                "team": "home" if event.get("isHome") else "away",
+                "player_in": (event.get("playerIn") or event.get("player") or {}).get("name", "Unknown"),
+                "player_out": (event.get("playerOut") or {}).get("name", "Unknown"),
+            })
+        subs.sort(key=lambda s: (s["minute"], s["added_time"]))
+        return subs
 
     def _extract_momentum(self, content: Dict) -> Optional[List[Dict]]:
         """Extract per-minute momentum data.
@@ -658,6 +724,14 @@ def main():
         action="store_true",
         help="Show summary of cached data without fetching",
     )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Path to read/write the matches cache. Default: "
+             "Data/soccer_backtest/matches.json. Use a date-stamped "
+             "path to avoid overwriting the canonical file.",
+    )
 
     args = parser.parse_args()
 
@@ -666,7 +740,8 @@ def main():
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    collector = BacktestCollector()
+    out = Path(args.output) if args.output else None
+    collector = BacktestCollector(matches_file=out)
 
     if args.summary:
         matches = list(collector._cached_matches.values())

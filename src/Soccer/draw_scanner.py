@@ -293,6 +293,22 @@ class DrawScanner:
             key = f"league_{lg.lower().replace(' ', '_')}"
             features[key] = 1 if league == lg else 0
 
+        # Card / substitution features from /incidents (if the loaded
+        # model wasn't trained with these, the columns are simply not
+        # in self._xgb_feature_cols and get ignored at predict time).
+        try:
+            from src.Soccer.feature_builder import (
+                _card_features_at, _sub_features_at,
+            )
+            features.update(
+                _card_features_at(details.get("cards"), minute, losing_team)
+            )
+            features.update(
+                _sub_features_at(details.get("substitutions"), minute, losing_team)
+            )
+        except Exception as e:
+            self.log.debug(f"Card/sub feature derivation skipped: {e}")
+
         # Stage 1: XGBoost prediction
         try:
             X_pred = np.array([[features.get(c, 0) if features.get(c) is not None else 0

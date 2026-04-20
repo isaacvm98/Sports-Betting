@@ -1,6 +1,6 @@
 """Backtest final draw and leading team wins models with actual PM prices."""
 import json, numpy as np
-from src.Soccer.equalizer_model import build_features, get_feature_columns, _get_season
+from src.Soccer.feature_builder import build_features, get_feature_columns, _get_season
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import roc_auc_score, brier_score_loss, log_loss
 import xgboost as xgb

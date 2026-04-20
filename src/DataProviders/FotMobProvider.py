@@ -160,10 +160,11 @@ class FotMobProvider:
             "raw": full raw response,
         }
         """
-        # Fetch event details, momentum graph, and statistics
+        # Fetch event details, momentum graph, statistics, and incidents
         event_data = self._get(f"{SOFASCORE_BASE}/event/{match_id}")
         graph_data = self._get(f"{SOFASCORE_BASE}/event/{match_id}/graph")
         stats_data = self._get(f"{SOFASCORE_BASE}/event/{match_id}/statistics")
+        incidents_data = self._get(f"{SOFASCORE_BASE}/event/{match_id}/incidents")
 
         if not event_data:
             return None
@@ -200,6 +201,12 @@ class FotMobProvider:
             # xG from statistics
             xg = self._extract_xg(stats_data)
 
+            # Cards and substitutions from incidents (same shape as
+            # sofascore_collector to keep training/live features consistent)
+            cards = self._extract_cards(incidents_data)
+            substitutions = self._extract_substitutions(incidents_data)
+            goals = self._extract_goals(incidents_data)
+
             # Extra time detection
             is_extra_time = self._detect_extra_time(event, minute)
 
@@ -215,6 +222,9 @@ class FotMobProvider:
                 "momentum": momentum,
                 "xg": xg,
                 "stats": stats_data if stats_data else {},
+                "goals": goals,
+                "cards": cards,
+                "substitutions": substitutions,
                 "is_extra_time": is_extra_time,
                 "raw": event_data,
             }
@@ -419,6 +429,82 @@ class FotMobProvider:
         except Exception as e:
             logger.debug(f"Error parsing momentum: {e}")
             return None
+
+    def _extract_cards(self, incidents_data: Optional[Dict]) -> List[Dict]:
+        """Cards normalized to {yellow, red, second_yellow}. Skips
+        rescinded (VAR-overturned) cards."""
+        cards: List[Dict] = []
+        if not incidents_data:
+            return cards
+        for inc in incidents_data.get("incidents", []) or []:
+            if inc.get("incidentType") != "card":
+                continue
+            if inc.get("rescinded"):
+                continue
+            cls = (inc.get("incidentClass") or "").lower()
+            if cls == "yellow":
+                card_type = "yellow"
+            elif cls == "red":
+                card_type = "red"
+            elif cls in ("yellowred", "secondyellow"):
+                card_type = "second_yellow"
+            else:
+                continue
+            cards.append({
+                "minute": inc.get("time", 0),
+                "added_time": inc.get("addedTime") or 0,
+                "team": "home" if inc.get("isHome") else "away",
+                "card_type": card_type,
+                "player": (inc.get("player") or {}).get("name", "Unknown"),
+            })
+        cards.sort(key=lambda c: (c["minute"], c["added_time"]))
+        return cards
+
+    def _extract_substitutions(self, incidents_data: Optional[Dict]) -> List[Dict]:
+        subs: List[Dict] = []
+        if not incidents_data:
+            return subs
+        for inc in incidents_data.get("incidents", []) or []:
+            if inc.get("incidentType") != "substitution":
+                continue
+            subs.append({
+                "minute": inc.get("time", 0),
+                "added_time": inc.get("addedTime") or 0,
+                "team": "home" if inc.get("isHome") else "away",
+                "player_in": (inc.get("playerIn") or {}).get("name", "Unknown"),
+                "player_out": (inc.get("playerOut") or {}).get("name", "Unknown"),
+            })
+        subs.sort(key=lambda s: (s["minute"], s["added_time"]))
+        return subs
+
+    def _extract_goals(self, incidents_data: Optional[Dict]) -> List[Dict]:
+        """Goal events from incidents. SofaScore /incidents returns
+        events in reverse-chronological order, so we sort by minute
+        first, then accumulate the running score."""
+        if not incidents_data:
+            return []
+        raw = [
+            inc for inc in (incidents_data.get("incidents") or [])
+            if inc.get("incidentType") == "goal"
+        ]
+        raw.sort(key=lambda x: (x.get("time", 0), x.get("addedTime") or 0))
+        home_after = away_after = 0
+        goals: List[Dict] = []
+        for inc in raw:
+            is_home = bool(inc.get("isHome"))
+            if is_home:
+                home_after += 1
+            else:
+                away_after += 1
+            goals.append({
+                "minute": inc.get("time", 0),
+                "team": "home" if is_home else "away",
+                "scorer": (inc.get("player") or {}).get("name", "Unknown"),
+                "home_after": home_after,
+                "away_after": away_after,
+                "is_own_goal": (inc.get("incidentClass") or "") == "ownGoal",
+            })
+        return goals
 
     def _extract_xg(self, stats_data: Optional[Dict]) -> Dict:
         """Extract xG from SofaScore statistics response.

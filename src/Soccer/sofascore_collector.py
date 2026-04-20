@@ -57,10 +57,27 @@ DATA_DIR = Path("Data/soccer_backtest")
 class SofaScoreCollector:
     """Collects historical match data from SofaScore for backtesting."""
 
-    def __init__(self, data_dir: Path = DATA_DIR):
-        self.data_dir = Path(data_dir)
+    def __init__(
+        self,
+        data_dir: Path = DATA_DIR,
+        matches_file: Optional[Path] = None,
+    ):
+        """
+        Args:
+            data_dir: directory for the cache (used when matches_file
+                      is not given).
+            matches_file: explicit path to read/write the cache. Takes
+                          precedence over data_dir. Use this to scrape
+                          to a versioned snapshot without touching the
+                          canonical matches.json.
+        """
+        if matches_file is not None:
+            self.matches_file = Path(matches_file)
+            self.data_dir = self.matches_file.parent
+        else:
+            self.data_dir = Path(data_dir)
+            self.matches_file = self.data_dir / "matches.json"
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.matches_file = self.data_dir / "matches.json"
         self._session = None
         self._cached: Dict[str, Dict] = {}
         self._load_cache()
@@ -176,8 +193,10 @@ class SofaScoreCollector:
             start_ts = event.get("startTimestamp", 0)
             date = datetime.utcfromtimestamp(start_ts).strftime("%Y-%m-%d") if start_ts else ""
 
-            # Goals from incidents
+            # Goals + cards + substitutions from incidents
             goals = self._extract_goals(incidents)
+            cards = self._extract_cards(incidents)
+            substitutions = self._extract_substitutions(incidents)
 
             # Momentum from graph
             momentum_data = None
@@ -230,6 +249,8 @@ class SofaScoreCollector:
                 "xg_home": xg_home,
                 "xg_away": xg_away,
                 "goals": goals,
+                "cards": cards,
+                "substitutions": substitutions,
                 "momentum_data": momentum_data is not None,
                 "qualifying": qualifying,
                 "losing_team_at_70": losing_team_at_70,
@@ -244,23 +265,26 @@ class SofaScoreCollector:
             return None
 
     def _extract_goals(self, incidents: Optional[Dict]) -> List[Dict]:
-        """Extract goals from SofaScore incidents endpoint."""
-        goals = []
+        """Extract goals from SofaScore incidents endpoint.
+
+        SofaScore /incidents returns events in reverse-chronological
+        order. We must sort by minute BEFORE accumulating the running
+        score, otherwise home_after/away_after are wrong.
+        """
         if not incidents:
-            return goals
+            return []
 
-        inc_list = incidents.get("incidents", [])
-        # Track running score
-        home_score, away_score = 0, 0
+        raw = [
+            inc for inc in incidents.get("incidents", [])
+            if inc.get("incidentType") == "goal"
+        ]
+        raw.sort(key=lambda x: (x.get("time", 0), x.get("addedTime") or 0))
 
-        for inc in inc_list:
-            inc_type = inc.get("incidentType", "")
-            if inc_type != "goal":
-                continue
-
-            minute = inc.get("time", 0)
+        goals = []
+        home_score = away_score = 0
+        for inc in raw:
             is_home = inc.get("isHome", False)
-            player_name = inc.get("player", {}).get("name", "Unknown")
+            player_name = (inc.get("player") or {}).get("name", "Unknown")
 
             if is_home:
                 home_score += 1
@@ -268,7 +292,7 @@ class SofaScoreCollector:
                 away_score += 1
 
             goals.append({
-                "minute": minute,
+                "minute": inc.get("time", 0),
                 "team": "home" if is_home else "away",
                 "scorer": player_name,
                 "score_after": f"{home_score}-{away_score}",
@@ -277,8 +301,59 @@ class SofaScoreCollector:
                 "is_own_goal": inc.get("incidentClass", "") == "ownGoal",
             })
 
-        goals.sort(key=lambda g: g["minute"])
         return goals
+
+    def _extract_cards(self, incidents: Optional[Dict]) -> List[Dict]:
+        """Extract card events. Normalizes SofaScore incidentClass to
+        {yellow, red, second_yellow}. Skips rescinded cards (VAR overturned)."""
+        cards = []
+        if not incidents:
+            return cards
+        for inc in incidents.get("incidents", []):
+            if inc.get("incidentType") != "card":
+                continue
+            if inc.get("rescinded"):
+                continue
+            cls = (inc.get("incidentClass") or "").lower()
+            if cls == "yellow":
+                card_type = "yellow"
+            elif cls == "red":
+                card_type = "red"
+            elif cls in ("yellowred", "secondyellow"):
+                card_type = "second_yellow"
+            else:
+                continue
+            minute = inc.get("time", 0)
+            added = inc.get("addedTime") or 0
+            cards.append({
+                "minute": minute,
+                "added_time": added,
+                "team": "home" if inc.get("isHome") else "away",
+                "card_type": card_type,
+                "player": (inc.get("player") or {}).get("name", "Unknown"),
+            })
+        cards.sort(key=lambda c: (c["minute"], c["added_time"]))
+        return cards
+
+    def _extract_substitutions(self, incidents: Optional[Dict]) -> List[Dict]:
+        """Extract substitution events from SofaScore incidents."""
+        subs = []
+        if not incidents:
+            return subs
+        for inc in incidents.get("incidents", []):
+            if inc.get("incidentType") != "substitution":
+                continue
+            minute = inc.get("time", 0)
+            added = inc.get("addedTime") or 0
+            subs.append({
+                "minute": minute,
+                "added_time": added,
+                "team": "home" if inc.get("isHome") else "away",
+                "player_in": (inc.get("playerIn") or {}).get("name", "Unknown"),
+                "player_out": (inc.get("playerOut") or {}).get("name", "Unknown"),
+            })
+        subs.sort(key=lambda s: (s["minute"], s["added_time"]))
+        return subs
 
     def _extract_xg(self, stats: Optional[Dict]) -> Tuple[Optional[float], Optional[float]]:
         """Extract xG from SofaScore statistics."""
@@ -468,12 +543,20 @@ def main():
     parser.add_argument("--all-seasons", action="store_true", help="Collect 24/25 + 25/26")
     parser.add_argument("--force", action="store_true", help="Re-fetch all (ignore cache)")
     parser.add_argument("--summary", action="store_true", help="Show cached data summary")
+    parser.add_argument(
+        "--output", type=str, default=None,
+        help="Path to read/write the matches cache. Default: "
+             "Data/soccer_backtest/matches.json (canonical). Use a "
+             "date-stamped path to scrape into a versioned snapshot "
+             "without overwriting the canonical file.",
+    )
 
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-    collector = SofaScoreCollector()
+    out = Path(args.output) if args.output else None
+    collector = SofaScoreCollector(matches_file=out)
 
     if args.summary:
         matches = list(collector._cached.values())

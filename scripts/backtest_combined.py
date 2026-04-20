@@ -1,7 +1,7 @@
 """Backtest combined XGBoost + survival model with actual PM prices."""
 import json, numpy as np, pandas as pd
 from collections import Counter
-from src.Soccer.equalizer_model import build_features, get_feature_columns, _get_season, _score_at_minute
+from src.Soccer.feature_builder import build_features, get_feature_columns, _get_season, _score_at_minute
 from src.Soccer.survival_model import build_survival_data, train_cox, get_survival_curve, COVARIATES
 from sklearn.calibration import CalibratedClassifierCV
 import xgboost as xgb
